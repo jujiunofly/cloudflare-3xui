@@ -1,0 +1,14 @@
+# Copy to the parent directory as docker-compose.yml after cloning this repo to ./app.
+services:
+  cloudflare-3xui:
+    build: ./app
+    container_name: cloudflare-3xui
+    restart: unless-stopped
+    init: true
+    ipc: host
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./cloudflare_ip.json:/app/cloudflare_ip.json

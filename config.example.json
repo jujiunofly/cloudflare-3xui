@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "panel": {
+    "base_url": "https://panel.example.com:2053/panel/api",
+    "api_token": "REPLACE_WITH_YOUR_3X_UI_BEARER_TOKEN",
+    "timeout_seconds": 45,
+    "retries": 3
+  },
+  "runtime": {
+    "discover_every_cycle": true,
+    "interval_minutes": 10,
+    "jitter_seconds": 45,
+    "browser_wait_ms": 20000,
+    "browser_timeout_ms": 30000,
+    "request_timeout_seconds": 20,
+    "api_retries": 3,
+    "fallback_on_failure": true,
+    "fallback_share_addr": "188.114.98.249"
+  },
+  "schedule": {
+    "enabled": false,
+    "start": "08:00",
+    "end": "23:30"
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "notify_on_success": false,
+    "notify_on_failure": true
+  }
+}
