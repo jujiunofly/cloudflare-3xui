@@ -1,6 +1,17 @@
 # Cloudflare IP → 3x-ui shareAddr 同步
 
-每轮都以 Playwright discover Cloudflare 页面当前 XHR API，再将第一条优选 IP 更新到 3x-ui：`cucc` 对应联通，`cmcc` 对应移动，`ctcc` 对应电信。接口不写回配置文件。
+仓库：https://github.com/jujiunofly/cloudflare-3xui
+
+每轮都以 Playwright discover Cloudflare 页面当前 XHR API，再将第一条优选 IP 更新到 3x-ui：
+
+| remark 关键字（不区分大小写） | 线路 |
+| --- | --- |
+| `cucc` | 联通 |
+| `cmcc` | 移动 |
+| `ctcc` | 电信 |
+| `mix` | 多线 |
+
+接口地址不写回配置文件。
 
 ## 每日运行区间与通知
 
@@ -19,7 +30,7 @@
 ```bash
 mkdir -p /opt/cloudflare-3xui
 cd /opt/cloudflare-3xui
-git clone https://github.com/YOUR_GITHUB_USER/cloudflare-3xui.git app
+git clone https://github.com/jujiunofly/cloudflare-3xui.git app
 cp app/docker-compose.server.yml docker-compose.yml
 cp app/config.example.json config.json
 nano config.json

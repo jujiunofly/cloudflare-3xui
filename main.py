@@ -73,11 +73,15 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def addresses_from_data(data: dict[str, list[dict[str, str]]]) -> dict[str, str]:
+    # 电信/联通/移动 are always required; 多线 is optional unless a MIX remark is present.
     required = ("电信", "联通", "移动")
     missing = [line for line in required if not data.get(line)]
     if missing:
         raise RuntimeError(f"Cloudflare data is missing: {', '.join(missing)}")
-    return {line: data[line][0]["ip"] for line in required}
+    addresses = {line: data[line][0]["ip"] for line in required}
+    if data.get("多线"):
+        addresses["多线"] = data["多线"][0]["ip"]
+    return addresses
 
 
 def status_lines(stats: DailyStats, now: datetime) -> str:

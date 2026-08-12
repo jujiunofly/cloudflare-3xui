@@ -11,7 +11,7 @@ import requests
 
 LOGGER = logging.getLogger(__name__)
 
-LINE_RULES = {"cucc": "联通", "cmcc": "移动", "ctcc": "电信"}
+LINE_RULES = {"cucc": "联通", "cmcc": "移动", "ctcc": "电信", "mix": "多线"}
 
 
 class PanelError(RuntimeError):
@@ -77,7 +77,7 @@ class PanelClient:
 
 
 def matching_inbounds(inbounds: Iterable[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
-    """Map only remarks containing cucc/cmcc/ctcc (case-insensitive) to a line."""
+    """Map remarks containing cucc/cmcc/ctcc/mix (case-insensitive) to a line."""
     matches: list[tuple[dict[str, Any], str]] = []
     for inbound in inbounds:
         remark = str(inbound.get("remark", "")).lower()
@@ -115,7 +115,7 @@ def update_matching_inbounds(client: PanelClient, addresses: dict[str, str], fal
                     failure += f"; fallback failed: {fallback_exc}"
             failures.append(failure)
     if not changes:
-        raise PanelError("no inbound remark contains cucc, cmcc, or ctcc")
+        raise PanelError("no inbound remark contains cucc, cmcc, ctcc, or mix")
     if failures:
         raise PanelError("some inbounds failed: " + "; ".join(failures))
     return changes
