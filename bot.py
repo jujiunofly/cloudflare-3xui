@@ -24,9 +24,11 @@ from node_state import (
     set_policy,
 )
 from notifier import (
+    TelegramApiError,
     answer_callback,
     edit_telegram,
     get_updates,
+    sanitize_button_text,
     send_telegram,
     set_bot_commands,
     telegram_enabled,
@@ -47,7 +49,6 @@ MAIN_KEYBOARD = {
         [{"text": "通知设置"}],
     ],
     "resize_keyboard": True,
-    "is_persistent": True,
 }
 
 BOT_COMMANDS = [
@@ -260,13 +261,13 @@ class TelegramBot:
         for key in NOTIFY_DEFAULTS:
             enabled = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
             lines.append(notify_flag_label(key, enabled))
-            action = "关" if enabled else "开"
+            action = "关闭" if enabled else "开启"
             label = NOTIFY_LABELS[key]
             rows.append([{
-                "text": f"{'🔕' if enabled else '🔔'} {action} {label}",
+                "text": sanitize_button_text(f"{action}{label}"),
                 "callback_data": f"notify:toggle:{key}",
             }])
-        rows.append([{"text": "🔄 刷新", "callback_data": "notify:refresh"}])
+        rows.append([{"text": "刷新", "callback_data": "notify:refresh"}])
         return "\n".join(lines), {"inline_keyboard": rows}
 
     def _send_notify_settings(self, token: str, chat_id: str | int) -> None:
@@ -301,7 +302,7 @@ class TelegramBot:
         if not nodes:
             return (
                 "📭 没有找到 remark 含 cucc / cmcc / ctcc / mix 的入站。",
-                {"inline_keyboard": [[{"text": "🔄 刷新", "callback_data": "nodes:refresh"}]]},
+                {"inline_keyboard": [[{"text": "刷新", "callback_data": "nodes:refresh"}]]},
             )
         lines = ["📋 当前节点列表", "━━━━━━━━━━━━━━━━"]
         keyboard: list[list[dict[str, str]]] = []
@@ -314,11 +315,12 @@ class TelegramBot:
                 f"   线路 {node['line']}｜地址 {addr}\n"
                 f"   {mode_label(node['mode'])}{locked_hint}"
             )
+            label = f"#{node['id']} {(node['remark'] or node['line'])[:12]}"
             keyboard.append([{
-                "text": f"#{node['id']} {node['remark'][:16] or node['line']}",
+                "text": sanitize_button_text(label),
                 "callback_data": f"node:{node['id']}",
             }])
-        keyboard.append([{"text": "🔄 刷新", "callback_data": "nodes:refresh"}])
+        keyboard.append([{"text": "刷新", "callback_data": "nodes:refresh"}])
         return "\n".join(lines), {"inline_keyboard": keyboard}
 
     def _send_node_list(self, token: str, chat_id: str | int) -> None:
@@ -355,13 +357,13 @@ class TelegramBot:
         )
         rows: list[list[dict[str, str]]] = []
         if node["mode"] != MODE_AUTO:
-            rows.append([{"text": "🔄 恢复自动更新", "callback_data": f"act:auto:{inbound_id}"}])
+            rows.append([{"text": "恢复自动更新", "callback_data": f"act:auto:{inbound_id}"}])
         if node["mode"] != MODE_PAUSE:
-            rows.append([{"text": "⏸ 暂停自动更新", "callback_data": f"act:pause:{inbound_id}"}])
-        rows.append([{"text": "🔒 锁定为固定 IP", "callback_data": f"act:lockask:{inbound_id}"}])
+            rows.append([{"text": "暂停自动更新", "callback_data": f"act:pause:{inbound_id}"}])
+        rows.append([{"text": "锁定固定IP", "callback_data": f"act:lockask:{inbound_id}"}])
         if node["mode"] == MODE_LOCKED:
-            rows.append([{"text": "🔓 解除锁定", "callback_data": f"act:unlock:{inbound_id}"}])
-        rows.append([{"text": "« 返回列表", "callback_data": "nodes:refresh"}])
+            rows.append([{"text": "解除锁定", "callback_data": f"act:unlock:{inbound_id}"}])
+        rows.append([{"text": "返回列表", "callback_data": "nodes:refresh"}])
         return text, {"inline_keyboard": rows}
 
     def _safe_edit(
@@ -379,37 +381,54 @@ class TelegramBot:
             edit_telegram(token, chat_id, int(message_id), text, reply_markup=markup)
         except Exception as exc:
             LOGGER.warning("editMessage failed, fallback send: %s", exc)
-            send_telegram(token, chat_id, text, reply_markup=markup)
+            try:
+                send_telegram(token, chat_id, text, reply_markup=markup)
+            except Exception as send_exc:
+                LOGGER.error("fallback send also failed: %s", send_exc)
+
+    def _ack(self, token: str, callback_id: str, text: str = "") -> None:
+        """Answer callbacks immediately so Telegram does not return query-too-old."""
+        if not callback_id:
+            return
+        try:
+            answer_callback(token, callback_id, text)
+        except Exception as exc:
+            LOGGER.warning("answerCallbackQuery failed: %s", exc)
 
     def _handle_callback(self, token: str, query: dict[str, Any]) -> None:
         data = str(query.get("data") or "")
         callback_id = str(query.get("id") or "")
         message = query.get("message") or {}
         chat = message.get("chat") or {}
+        # Some clients put chat under from/message differently; prefer message.chat.
         chat_id = chat.get("id")
+        if chat_id is None and isinstance(query.get("from"), dict):
+            # private chats only — not a substitute for group, but avoids hard crash
+            chat_id = query.get("message", {}).get("chat", {}).get("id")
         message_id = message.get("message_id")
         if chat_id is None or not self._authorized(chat_id):
-            if callback_id:
-                answer_callback(token, callback_id, "未授权")
+            self._ack(token, callback_id, "未授权")
             return
+
+        # Acknowledge first: slow panel API after this will no longer break the click.
+        self._ack(token, callback_id)
+
         try:
             if data == "nodes:refresh":
                 text, markup = self._list_text_and_markup()
                 self._safe_edit(token, chat_id, message_id, text, markup)
-                answer_callback(token, callback_id, "已刷新")
                 return
 
             if data.startswith("node:"):
                 inbound_id = int(data.split(":", 1)[1])
                 text, markup = self._node_detail(inbound_id)
                 self._safe_edit(token, chat_id, message_id, text, markup)
-                answer_callback(token, callback_id)
                 return
 
             if data.startswith("act:"):
                 parts = data.split(":")
                 if len(parts) != 3:
-                    answer_callback(token, callback_id, "无效操作")
+                    send_telegram(token, chat_id, "无效操作", reply_markup=MAIN_KEYBOARD)
                     return
                 _, action, id_text = parts
                 inbound_id = int(id_text)
@@ -417,32 +436,31 @@ class TelegramBot:
                 if action != "lockask":
                     text, markup = self._node_detail(inbound_id)
                     self._safe_edit(token, chat_id, message_id, text, markup)
-                answer_callback(token, callback_id, note)
+                    # Confirm result with a short chat line (callback already acked).
+                    send_telegram(token, chat_id, f"✅ {note}", reply_markup=MAIN_KEYBOARD)
                 return
 
             if data == "notify:refresh" or data.startswith("notify:toggle:"):
+                note = "已刷新"
                 if data.startswith("notify:toggle:"):
                     key = data.split(":", 2)[2]
                     if key not in NOTIFY_DEFAULTS:
-                        answer_callback(token, callback_id, "未知开关")
+                        send_telegram(token, chat_id, "未知开关", reply_markup=MAIN_KEYBOARD)
                         return
                     current = bool(self._effective_tg().get(key, NOTIFY_DEFAULTS[key]))
                     set_notify_flag(self.node_state_path, key, not current)
                     note = f"{NOTIFY_LABELS[key]} 已{'关闭' if current else '开启'}"
-                else:
-                    note = "已刷新"
                 text, markup = self._notify_text_and_markup()
                 self._safe_edit(token, chat_id, message_id, text, markup)
-                answer_callback(token, callback_id, note)
+                if data.startswith("notify:toggle:"):
+                    send_telegram(token, chat_id, f"🔔 {note}", reply_markup=MAIN_KEYBOARD)
                 return
 
-            # Stale / foreign inline buttons — answer quietly, no chat spam.
             LOGGER.info("Ignoring unknown callback: %s", data)
-            answer_callback(token, callback_id)
-        except Exception as exc:
-            LOGGER.exception("Callback failed")
+        except (TelegramApiError, PanelError, Exception) as exc:
+            LOGGER.exception("Callback failed: %s", data)
             try:
-                answer_callback(token, callback_id, f"失败: {exc}"[:180])
+                send_telegram(token, chat_id, f"❌ 操作失败：{exc}", reply_markup=MAIN_KEYBOARD)
             except Exception:
                 pass
 

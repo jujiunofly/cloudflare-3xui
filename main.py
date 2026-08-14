@@ -106,7 +106,7 @@ def success_message(addresses: dict[str, str], changes: list[dict[str, Any]], st
         skip_lines.append("🔒 锁定：" + "、".join(f"#{item['id']}" for item in locked))
     skip_block = ("\n" + "\n".join(skip_lines)) if skip_lines else ""
     return (
-        "🛰️ Cloudflare → 3x-ui 🫛泡豆🫛同步完成\n"
+        "🛰️ Cloudflare → 3x-ui 同步完成\n"
         "━━━━━━━━━━━━━━━━\n"
         "📡 本轮优选 IP\n"
         f"{address_lines}\n"
