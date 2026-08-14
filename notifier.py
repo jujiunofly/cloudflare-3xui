@@ -87,7 +87,13 @@ def edit_telegram(
     }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    return _api(token, "editMessageText", payload, timeout=timeout)
+    try:
+        return _api(token, "editMessageText", payload, timeout=timeout)
+    except RuntimeError as exc:
+        # Tapping the same toggle twice, or refresh with identical content.
+        if "message is not modified" in str(exc).lower():
+            return None
+        raise
 
 
 def answer_callback(token: str, callback_query_id: str, text: str = "", timeout: float = 20) -> Any:
@@ -112,6 +118,8 @@ def get_updates(token: str, offset: int | None, timeout: int, request_timeout: f
 
 def set_bot_commands(token: str, commands: list[dict[str, str]], timeout: float = 20) -> None:
     try:
+        # Clear stale command menus first (old bots / other apps may leave junk entries).
+        _api(token, "deleteMyCommands", {}, timeout=timeout)
         _api(token, "setMyCommands", {"commands": commands}, timeout=timeout)
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         LOGGER.warning("setMyCommands failed: %s", exc)
