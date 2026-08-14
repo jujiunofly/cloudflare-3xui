@@ -13,10 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from api_client import fetch_apis, load_config
-from bot import TelegramBot
 from browser_capture import discover_sync
 from node_state import effective_telegram, load_node_state
-from notifier import notify_telegram, telegram_enabled
+from notifier import notify_telegram
 from panel_client import PanelClient, PanelError, update_matching_inbounds
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -153,14 +152,6 @@ def main() -> int:
     setup_logging()
     stats = DailyStats()
     last_active: bool | None = None
-
-    if not args.once:
-        try:
-            cfg = load_config(CONFIG_PATH)
-            if telegram_enabled(cfg.get("telegram", {})):
-                TelegramBot(CONFIG_PATH, NODE_STATE_PATH, panel_client).start()
-        except Exception as exc:
-            logging.warning("bot not started: %s", exc)
 
     while True:
         ok = True
