@@ -13,13 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from api_client import fetch_apis, load_config
+from bot import TelegramBot
 from browser_capture import discover_sync
-from notifier import notify_telegram
+from node_state import load_node_state
+from notifier import notify_telegram, telegram_enabled
 from panel_client import PanelClient, PanelError, update_matching_inbounds
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 OUTPUT_PATH = BASE_DIR / "cloudflare_ip.json"
+NODE_STATE_PATH = BASE_DIR / "node_state.json"
 LINES = ("电信", "联通", "移动", "多线")
 
 
@@ -89,19 +92,28 @@ def status_lines(stats: DailyStats, now: datetime) -> str:
 
 
 def success_message(addresses: dict[str, str], changes: list[dict[str, Any]], stats: DailyStats, now: datetime) -> str:
-    updated = [item for item in changes if item.get("changed") and not item.get("fallback")]
-    unchanged = [item for item in changes if not item.get("changed")]
+    updated = [item for item in changes if item.get("changed") and not item.get("fallback") and not item.get("skipped")]
+    unchanged = [item for item in changes if not item.get("changed") and not item.get("skipped")]
     fallback = [item for item in changes if item.get("fallback")]
+    paused = [item for item in changes if item.get("reason") == "pause"]
+    locked = [item for item in changes if item.get("reason") == "locked"]
     address_lines = "\n".join(f"  • {line}: {address}" for line, address in addresses.items())
     change_lines = "\n".join(f"  • #{item['id']} {item['remark']} → {item['address']}" for item in updated + fallback) or "  • 无需变更"
+    skip_lines = []
+    if paused:
+        skip_lines.append("⏸ 暂停：" + "、".join(f"#{item['id']}" for item in paused))
+    if locked:
+        skip_lines.append("🔒 锁定：" + "、".join(f"#{item['id']}" for item in locked))
+    skip_block = ("\n" + "\n".join(skip_lines)) if skip_lines else ""
     return (
         "🛰️ Cloudflare → 3x-ui 🫛泡豆🫛同步完成\n"
         "━━━━━━━━━━━━━━━━\n"
         "📡 本轮优选 IP\n"
         f"{address_lines}\n"
         "🛠️ 入站处理\n"
-        f"{change_lines}\n"
-        f"📊 更新 {len(updated)} 条｜保持 {len(unchanged)} 条｜单条回退 {len(fallback)} 条\n"
+        f"{change_lines}{skip_block}\n"
+        f"📊 更新 {len(updated)} 条｜保持 {len(unchanged)} 条｜单条回退 {len(fallback)} 条"
+        f"｜暂停 {len(paused)}｜锁定 {len(locked)}\n"
         f"{status_lines(stats, now)}\n"
         "✨ 下一班车将按配置时间加随机抖动抵达。"
     )
@@ -118,7 +130,30 @@ def failure_message(exc: Exception, stats: DailyStats, now: datetime) -> str:
     )
 
 
-def panel_client(config: dict[str, Any], timeout: float) -> PanelClient:
+def schedule_start_message(config: dict[str, Any], now: datetime) -> str:
+    schedule = config.get("schedule", {})
+    return (
+        "🌅 工作时段开始\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🕒 现在：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"📅 窗口：{schedule.get('start', '?')} → {schedule.get('end', '?')}\n"
+        "🚀 同步任务已苏醒，开始抓取优选 IP。"
+    )
+
+
+def schedule_rest_message(config: dict[str, Any], now: datetime) -> str:
+    schedule = config.get("schedule", {})
+    return (
+        "🌙 进入休息时段\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🕒 现在：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"📅 窗口：{schedule.get('start', '?')} → {schedule.get('end', '?')}\n"
+        "😴 本时段不再自动同步，节点地址保持现状。\n"
+        "💬 仍可通过机器人查看节点 / 手动锁定。"
+    )
+
+
+def panel_client(config: dict[str, Any], timeout: float | None = None) -> PanelClient:
     panel = config.get("panel", {})
     base_url = str(panel.get("base_url", "")).strip()
     token = str(panel.get("api_token", "")).strip()
@@ -126,15 +161,45 @@ def panel_client(config: dict[str, Any], timeout: float) -> PanelClient:
         raise PanelError("configure panel.base_url and panel.api_token in config.json")
     # The panel can be slower than the lightweight Cloudflare data API.
     # These optional settings preserve backward compatibility with old config.
-    panel_timeout = float(panel.get("timeout_seconds", 45))
+    panel_timeout = float(panel.get("timeout_seconds", timeout if timeout is not None else 45))
     retries = int(panel.get("retries", 3))
     return PanelClient(base_url, token, panel_timeout, retries)
+
+
+def panel_client_from_config(config: dict[str, Any]) -> PanelClient:
+    runtime = config.get("runtime", {})
+    timeout = float(runtime.get("request_timeout_seconds", 20))
+    return panel_client(config, timeout)
+
+
+def maybe_notify_schedule_transition(
+    config: dict[str, Any],
+    now: datetime,
+    active: bool,
+    last_active: bool | None,
+) -> bool:
+    """Send start/rest notices on window edges. Returns the new last_active value."""
+    schedule = config.get("schedule", {})
+    if not schedule.get("enabled", False):
+        return active
+    if last_active is None:
+        return active
+    if last_active == active:
+        return active
+    tg = config.get("telegram", {})
+    timeout = float(config.get("runtime", {}).get("request_timeout_seconds", 20))
+    if active and tg.get("notify_on_start", True):
+        notify_telegram(tg, schedule_start_message(config, now), timeout)
+        logging.info("Sent schedule start notification")
+    if not active and tg.get("notify_on_rest", True):
+        notify_telegram(tg, schedule_rest_message(config, now), timeout)
+        logging.info("Sent schedule rest notification")
+    return active
 
 
 def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
     runtime = config["runtime"]
     timeout = float(runtime["request_timeout_seconds"])
-    client: PanelClient | None = None
     try:
         client = panel_client(config, timeout)
         # Default behaviour is discovery on every cycle: site data changes every 10 minutes.
@@ -154,7 +219,13 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
         addresses = addresses_from_data(data)
         write_output(data)
         fallback = str(runtime.get("fallback_share_addr", "")).strip() if runtime.get("fallback_on_failure", True) else None
-        changes = update_matching_inbounds(client, addresses, fallback)
+        node_state = load_node_state(NODE_STATE_PATH)
+        changes = update_matching_inbounds(
+            client,
+            addresses,
+            fallback,
+            node_policies=node_state.get("inbounds", {}),
+        )
         message = success_message(addresses, changes, stats, now)
         if config["telegram"].get("notify_on_success", False):
             notify_telegram(config["telegram"], message, timeout)
@@ -170,6 +241,37 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
         raise
 
 
+def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
+    now = datetime.now()
+    try:
+        config = load_config(CONFIG_PATH)
+    except Exception as exc:
+        return f"❌ 读取配置失败：{exc}"
+    schedule = config.get("schedule", {})
+    enabled = bool(schedule.get("enabled", False))
+    active = in_run_window(config, now)
+    if not enabled:
+        phase = "全天运行（未启用时间窗）"
+        window = "关闭（全天）"
+    else:
+        phase = "🟢 工作中" if active else "🌙 休息中"
+        window = f"{schedule.get('start')} → {schedule.get('end')}"
+    if last_active is None:
+        memory = "尚未观察"
+    else:
+        memory = "工作" if last_active else "休息"
+    return (
+        "📟 运行状态\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"当前：{phase}\n"
+        f"时间：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"窗口：{window}\n"
+        f"今日：尝试 {stats.attempts}｜成功 {stats.successes}｜失败 {stats.failures}\n"
+        f"状态记忆：{memory}\n"
+        "提示：发送「节点列表」可管理是否参与更新 / 锁定 IP。"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="run one synchronisation cycle, then exit")
@@ -177,13 +279,34 @@ def main() -> int:
     setup_logging()
     default_delay = 10 * 60
     stats = DailyStats()
+    last_active: bool | None = None
+    bot: TelegramBot | None = None
+
+    def status_provider() -> str:
+        return build_status_text(stats, last_active)
+
+    try:
+        boot_config = load_config(CONFIG_PATH)
+        if telegram_enabled(boot_config.get("telegram", {})) and not args.once:
+            bot = TelegramBot(
+                CONFIG_PATH,
+                NODE_STATE_PATH,
+                panel_client_from_config,
+                status_provider=status_provider,
+            )
+            bot.start()
+    except Exception as exc:
+        logging.warning("Telegram bot not started: %s", exc)
+
     while True:
         succeeded = True
         delay = default_delay
         now = datetime.now()
         try:
             config = load_config(CONFIG_PATH)
-            if in_run_window(config, now):
+            active = in_run_window(config, now)
+            last_active = maybe_notify_schedule_transition(config, now, active, last_active)
+            if active:
                 # Record before notifications, so the message includes this run.
                 try:
                     stats.record(True)
@@ -197,10 +320,16 @@ def main() -> int:
             interval = float(runtime["interval_minutes"]) * 60
             jitter = float(runtime["jitter_seconds"])
             delay = max(1, interval + random.uniform(-jitter, jitter))
+            # During rest, wake more often so start/rest edges are not delayed
+            # by a full sync interval (still not second-level precision).
+            if not active and config.get("schedule", {}).get("enabled", False):
+                delay = min(delay, 60.0)
         except Exception as exc:
             succeeded = False  # errors have already been logged and optionally notified
             logging.error("Cycle ended with an error; the process will stay alive: %s", exc)
         if args.once:
+            if bot:
+                bot.stop()
             return 0 if succeeded else 1
         logging.info("Next cycle in %.0f seconds", delay)
         time.sleep(delay)

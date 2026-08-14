@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 cloudflare_ip.json
 config.json
+node_state.json

@@ -12,3 +12,4 @@ services:
     volumes:
       - ./config.json:/app/config.json:ro
       - ./cloudflare_ip.json:/app/cloudflare_ip.json
+      - ./node_state.json:/app/node_state.json

@@ -87,10 +87,54 @@ def matching_inbounds(inbounds: Iterable[dict[str, Any]]) -> list[tuple[dict[str
     return matches
 
 
-def update_matching_inbounds(client: PanelClient, addresses: dict[str, str], fallback_address: str | None = None) -> list[dict[str, Any]]:
+def update_matching_inbounds(
+    client: PanelClient,
+    addresses: dict[str, str],
+    fallback_address: str | None = None,
+    node_policies: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Update matching inbounds.
+
+    node_policies maps inbound id (str) -> {"mode": auto|pause|locked, "locked_address": ...}.
+    pause/locked nodes are skipped by the automatic sync cycle.
+    """
+    from node_state import MODE_AUTO, MODE_LOCKED, MODE_PAUSE, get_policy
+
+    state = {"inbounds": node_policies or {}}
     changes: list[dict[str, Any]] = []
     failures: list[str] = []
-    for inbound, line in matching_inbounds(client.list_inbounds()):
+    matched = matching_inbounds(client.list_inbounds())
+    if not matched:
+        raise PanelError("no inbound remark contains cucc, cmcc, ctcc, or mix")
+
+    for inbound, line in matched:
+        policy = get_policy(state, inbound["id"])
+        mode = policy.get("mode", MODE_AUTO)
+        if mode == MODE_PAUSE:
+            changes.append({
+                "id": inbound["id"],
+                "remark": inbound.get("remark", ""),
+                "line": line,
+                "address": inbound.get("shareAddr"),
+                "changed": False,
+                "skipped": True,
+                "reason": "pause",
+            })
+            LOGGER.info("3x-ui inbound %s (%s) skipped (paused)", inbound["id"], inbound.get("remark", ""))
+            continue
+        if mode == MODE_LOCKED:
+            changes.append({
+                "id": inbound["id"],
+                "remark": inbound.get("remark", ""),
+                "line": line,
+                "address": policy.get("locked_address") or inbound.get("shareAddr"),
+                "changed": False,
+                "skipped": True,
+                "reason": "locked",
+            })
+            LOGGER.info("3x-ui inbound %s (%s) skipped (locked)", inbound["id"], inbound.get("remark", ""))
+            continue
+
         address = addresses.get(line)
         if not address:
             raise PanelError(f"missing address for {line}")
@@ -114,8 +158,6 @@ def update_matching_inbounds(client: PanelClient, addresses: dict[str, str], fal
                 except PanelError as fallback_exc:
                     failure += f"; fallback failed: {fallback_exc}"
             failures.append(failure)
-    if not changes:
-        raise PanelError("no inbound remark contains cucc, cmcc, ctcc, or mix")
     if failures:
         raise PanelError("some inbounds failed: " + "; ".join(failures))
     return changes

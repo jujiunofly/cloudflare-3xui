@@ -27,6 +27,8 @@
     "bot_token": "",
     "chat_id": "",
     "notify_on_success": false,
-    "notify_on_failure": true
+    "notify_on_failure": true,
+    "notify_on_start": true,
+    "notify_on_rest": true
   }
 }
