@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -81,16 +82,34 @@ def load_node_state(path: Path) -> dict[str, Any]:
 
 
 def save_node_state(path: Path, state: dict[str, Any]) -> None:
+    """Persist state.
+
+    Docker often bind-mounts a single host file onto ``node_state.json``.
+    Atomic rename (``*.tmp`` → target) then fails with
+    ``[Errno 16] Device or resource busy``. Write in-place instead.
+    """
     with _LOCK:
+        if path.exists() and path.is_dir():
+            raise OSError(
+                f"{path} is a directory (Docker created a mount dir because the host file was missing). "
+                "On the host run: rm -rf node_state.json; "
+                "echo '{\"schema_version\":1,\"inbounds\":{},\"telegram\":{}}' > node_state.json"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": 1,
             "inbounds": state.get("inbounds", {}),
             "telegram": _clean_telegram(state.get("telegram")),
         }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        # In-place overwrite is required for bind-mounted files.
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
 
 
 def get_policy(state: dict[str, Any], inbound_id: int | str) -> dict[str, Any]:
