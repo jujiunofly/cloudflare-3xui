@@ -1,147 +1,100 @@
-# Cloudflare IP → 3x-ui shareAddr 同步
+# Cloudflare IP → 3x-ui
 
-仓库：https://github.com/jujiunofly/cloudflare-3xui
+https://github.com/jujiunofly/cloudflare-3xui
 
-每轮都以 Playwright discover Cloudflare 页面当前 XHR API，再将第一条优选 IP 更新到 3x-ui：
+自动发现优选 IP，更新 3x-ui 入站 `shareAddr`。
 
-| remark 关键字（不区分大小写） | 线路 |
+| remark 含 | 线路 |
 | --- | --- |
-| `cucc` | 联通 |
-| `cmcc` | 移动 |
-| `ctcc` | 电信 |
-| `mix` | 多线 |
+| cucc | 联通 |
+| cmcc | 移动 |
+| ctcc | 电信 |
+| mix | 多线 |
 
-接口地址不写回配置文件。节点的「暂停 / 锁定」策略写在可写文件 `node_state.json`。
+## 功能（就这些）
 
-## 每日运行区间与通知
+1. **定时同步**（可配工作时段）
+2. **开始/休息通知**
+3. **成功/失败通知**（可关）
+4. **Telegram 管理节点**
+   - 是否参与自动更新
+   - 锁定固定 IP / 解锁
 
-在 `config.json` 编辑：
+## config 示例
 
 ```json
-"schedule": { "enabled": true, "start": "08:00", "end": "23:30" },
-"telegram": {
-  "enabled": true,
-  "bot_token": "123456:ABC...",
-  "chat_id": "你的数字 chat_id",
-  "notify_on_success": false,
-  "notify_on_failure": true,
-  "notify_on_start": true,
-  "notify_on_rest": true
+{
+  "panel": {
+    "base_url": "https://panel.example.com:2053/panel/api",
+    "api_token": "TOKEN"
+  },
+  "runtime": {
+    "discover_every_cycle": true,
+    "interval_minutes": 10,
+    "jitter_seconds": 45,
+    "browser_wait_ms": 20000,
+    "browser_timeout_ms": 30000,
+    "request_timeout_seconds": 20,
+    "api_retries": 3,
+    "fallback_on_failure": true,
+    "fallback_share_addr": "188.114.98.249"
+  },
+  "schedule": {
+    "enabled": true,
+    "start": "08:00",
+    "end": "23:30"
+  },
+  "telegram": {
+    "enabled": true,
+    "bot_token": "BOT_TOKEN",
+    "chat_id": "你的数字ID",
+    "notify_on_success": false,
+    "notify_on_failure": true,
+    "notify_on_start": true,
+    "notify_on_rest": true
+  }
 }
 ```
 
-采用本地时区（Compose 默认 `Asia/Shanghai`）。支持跨日区间，例如 `22:00` 至 `06:00`。非运行时间不采集也不修改面板。
+完整模板见 `config.example.json`。
 
-- **工作开始**（进入窗口）：发送「工作时段开始」通知  
-- **进入休息**（离开窗口）：发送「进入休息时段」通知  
-- 成功 / 失败通知可按上面开关控制  
+## Telegram 怎么设
 
-休息时段仍可用机器人查看节点并手动锁定 / 解锁。
+1. `@BotFather` → `/newbot` → 拿到 token → 填 `bot_token`
+2. 给机器人发任意消息，用 `@userinfobot` 或  
+   `https://api.telegram.org/bot<Token>/getUpdates` 看 `chat.id` → 填 `chat_id`
+3. `enabled: true`，重启容器
+4. 发 `/start`，用按钮：
+   - **节点列表**：点节点 → 参与/不参与/锁定/解锁
+   - **通知设置**：成功、失败、开始、休息 开关
 
-## Telegram 机器人设置
+通知开关写在 `node_state.json`（可改，不必动只读 config）。
 
-### 1. 创建机器人
-
-1. 在 Telegram 搜索 `@BotFather`
-2. 发送 `/newbot`，按提示起名
-3. 复制得到的 **HTTP API Token**，填到 `config.json` 的 `telegram.bot_token`
-
-### 2. 拿到自己的 chat_id
-
-任选一种：
-
-- 给 `@userinfobot` 发任意消息，它会回复你的数字 ID  
-- 或先给自己的机器人发一条 `/start`，再浏览器打开：  
-  `https://api.telegram.org/bot<你的Token>/getUpdates`  
-  在 JSON 里找 `"chat":{"id": 数字}`
-
-把该数字填到 `telegram.chat_id`（必须是字符串或数字均可，程序会转成字符串比对）。**只有这个 chat 能操作节点**，其他人发消息会被忽略。
-
-### 3. 打开机器人功能
-
-```json
-"telegram": {
-  "enabled": true,
-  "bot_token": "...",
-  "chat_id": "123456789",
-  "notify_on_start": true,
-  "notify_on_rest": true,
-  "notify_on_failure": true
-}
-```
-
-保存后重启容器 / 进程。
-
-### 4. 使用方式
-
-给机器人发送：
-
-| 操作 | 命令 / 按钮 |
-| --- | --- |
-| 打开菜单 | `/start` |
-| 节点列表 | `/nodes` 或按钮 **节点列表** |
-| 运行状态 | `/status` 或按钮 **运行状态** |
-| 通知设置 | `/notify` 或按钮 **通知设置** |
-
-在节点列表里点某个节点，可以：
-
-- **恢复自动更新**：本轮起重新参与优选 IP 同步  
-- **暂停自动更新**：保留当前地址，跳过自动同步  
-- **锁定为固定 IP**：按提示发送 IP/域名，立刻写入 3x-ui，并不再自动改  
-- **解除锁定**：回到自动更新  
-
-在 **通知设置** 里可开关：
-
-- 成功消息  
-- 失败消息  
-- 开始工作通知  
-- 进入休息通知  
-
-开关会写到 `node_state.json`（覆盖 `config.json` 里同名默认值），Docker 下不必改只读配置。
-
-策略持久化在 `node_state.json`（Docker 需挂载，见下）。
-
-> 本项目使用 long polling（`getUpdates`）。启动时会自动 `deleteWebhook`。  
->
-> **同一 bot token 只能有一个程序在跑。** 若日志出现  
-> `Conflict: terminated by other getUpdates request`，说明还有别的容器/本机进程/其他机器在用这个 token：
->
-> ```bash
-> docker ps | grep cloudflare
-> docker compose down
-> # 确认没有第二个 compose / 旧容器 / 本机 python main.py
-> docker compose up -d --build
-> ```
-
-## 推荐 Docker Compose 部署
+**一个 token 只能跑一个容器。** 出现 Conflict 时：
 
 ```bash
-mkdir -p /opt/cloudflare-3xui
-cd /opt/cloudflare-3xui
+docker compose down
+docker compose up -d
+```
+
+## Docker
+
+```bash
+mkdir -p /opt/cloudflare-3xui && cd /opt/cloudflare-3xui
 git clone https://github.com/jujiunofly/cloudflare-3xui.git app
 cp app/docker-compose.server.yml docker-compose.yml
 cp app/config.example.json config.json
 nano config.json
 touch cloudflare_ip.json
-echo '{"schema_version":1,"inbounds":{}}' > node_state.json
+echo '{"schema_version":1,"inbounds":{},"telegram":{}}' > node_state.json
 docker compose up -d --build
-docker compose logs -f
 ```
 
-目录：
-
-```text
-/opt/cloudflare-3xui/
-├── docker-compose.yml
-├── config.json
-├── cloudflare_ip.json
-├── node_state.json
-└── app/
-```
-
-更新代码：
+更新：
 
 ```bash
 cd /opt/cloudflare-3xui/app && git pull
 cd .. && docker compose up -d --build
 ```
+
+`node_state.json` / `cloudflare_ip.json` 必须是**文件**，不能是目录。

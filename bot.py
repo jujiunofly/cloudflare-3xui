@@ -1,4 +1,4 @@
-"""Interactive Telegram bot for node list / pause / lock / unlock."""
+"""Simple Telegram control: nodes + notify switches."""
 from __future__ import annotations
 
 import logging
@@ -19,112 +19,45 @@ from node_state import (
     get_policy,
     load_node_state,
     mode_label,
-    notify_flag_label,
     set_notify_flag,
     set_policy,
 )
-from notifier import (
-    TelegramApiError,
-    answer_callback,
-    delete_webhook,
-    edit_telegram,
-    get_updates,
-    sanitize_button_text,
-    send_telegram,
-    set_bot_commands,
-    telegram_enabled,
-)
-from panel_client import PanelClient, PanelError, matching_inbounds
+from notifier import answer, edit, get_updates, send, setup_bot, telegram_enabled
+from panel_client import PanelClient, matching_inbounds
 
 LOGGER = logging.getLogger(__name__)
-IP_RE = re.compile(
-    r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$"
-    r"|^(?:[A-Fa-f0-9:]+:+)+[A-Fa-f0-9]+$"
-)
-# /start@MyBot extra args → start
-COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)")
+CMD_RE = re.compile(r"^/([a-zA-Z0-9_]+)(?:@[A-Za-z0-9_]+)?")
 
-MAIN_KEYBOARD = {
-    "keyboard": [
-        [{"text": "节点列表"}, {"text": "运行状态"}],
-        [{"text": "通知设置"}],
-    ],
+KEYBOARD = {
+    "keyboard": [[{"text": "节点列表"}, {"text": "通知设置"}]],
     "resize_keyboard": True,
 }
-
-BOT_COMMANDS = [
-    {"command": "start", "description": "打开菜单"},
-    {"command": "nodes", "description": "查看节点列表"},
-    {"command": "status", "description": "查看运行状态"},
-    {"command": "notify", "description": "通知开关设置"},
-    {"command": "cancel", "description": "取消当前输入"},
-]
-
-# Exact keyboard / alias text → intent
-MENU_INTENTS: dict[str, str] = {
-    "节点列表": "nodes",
-    "节点": "nodes",
-    "运行状态": "status",
-    "状态": "status",
-    "通知设置": "notify",
-    "通知": "notify",
-    "菜单": "start",
-    "start": "start",
-    "nodes": "nodes",
-    "status": "status",
-    "notify": "notify",
-    "cancel": "cancel",
-    "取消": "cancel",
-}
-
-
-def resolve_intent(text: str) -> str | None:
-    """Map user text to a known intent; None means ignore (not 'unknown command')."""
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    if raw in MENU_INTENTS:
-        return MENU_INTENTS[raw]
-    lowered = raw.lower()
-    if lowered in MENU_INTENTS:
-        return MENU_INTENTS[lowered]
-    match = COMMAND_RE.match(raw)
-    if match:
-        name = match.group(1).lower()
-        if name in {"start", "nodes", "status", "notify", "cancel", "help", "menu"}:
-            return "start" if name in {"help", "menu"} else name
-        # Slash command we do not implement — caller may soft-reply once.
-        return f"unknown:{name}"
-    return None
 
 
 class TelegramBot:
     def __init__(
         self,
         config_path: Path,
-        node_state_path: Path,
-        panel_client_factory: Callable[[dict[str, Any]], PanelClient],
+        state_path: Path,
+        panel_factory: Callable[[dict[str, Any]], PanelClient],
         status_provider: Callable[[], str] | None = None,
     ) -> None:
         self.config_path = config_path
-        self.node_state_path = node_state_path
-        self.panel_client_factory = panel_client_factory
+        self.state_path = state_path
+        self.panel_factory = panel_factory
         self.status_provider = status_provider
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._offset: int | None = None
-        self._commands_registered = False
-        self._webhook_cleared = False
-        # chat_id -> {"action": "lock", "inbound_id": int}
-        self._pending: dict[str, dict[str, Any]] = {}
+        self._ready = False
+        self._pending: dict[str, int] = {}  # chat_id -> inbound_id waiting for lock IP
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="telegram-bot", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="telegram-bot", daemon=True)
         self._thread.start()
-        LOGGER.info("Telegram bot thread started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -135,27 +68,13 @@ class TelegramBot:
     def _tg(self) -> dict[str, Any]:
         return self._cfg().get("telegram", {})
 
-    def _authorized(self, chat_id: str | int) -> bool:
-        expected = str(self._tg().get("chat_id", "")).strip()
-        return bool(expected) and str(chat_id) == expected
-
     def _token(self) -> str:
         return str(self._tg().get("bot_token", "")).strip()
 
-    def _prepare_polling(self, token: str) -> None:
-        if not self._webhook_cleared:
-            try:
-                delete_webhook(token, drop_pending=True)
-                LOGGER.info("Telegram webhook cleared; using long polling")
-            except Exception as exc:
-                LOGGER.warning("deleteWebhook failed: %s", exc)
-            self._webhook_cleared = True
-        if not self._commands_registered:
-            set_bot_commands(token, BOT_COMMANDS)
-            self._commands_registered = True
-            LOGGER.info("Telegram bot commands registered")
+    def _ok_chat(self, chat_id: Any) -> bool:
+        return str(chat_id) == str(self._tg().get("chat_id", "")).strip()
 
-    def _run(self) -> None:
+    def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 tg = self._tg()
@@ -163,389 +82,225 @@ class TelegramBot:
                     time.sleep(5)
                     continue
                 token = self._token()
-                self._prepare_polling(token)
-                updates = get_updates(token, self._offset, timeout=25, request_timeout=35)
-                for update in updates:
-                    update_id = int(update.get("update_id", 0))
-                    self._offset = update_id + 1
-                    try:
-                        self._handle_update(token, update)
-                    except Exception:
-                        LOGGER.exception("Failed to handle Telegram update %s", update_id)
-            except TelegramApiError as exc:
-                desc = exc.description.lower()
-                if "conflict" in desc and "getupdates" in desc:
+                if not self._ready:
+                    setup_bot(token)
+                    self._ready = True
+                    LOGGER.info("Telegram bot ready")
+                for upd in get_updates(token, self._offset):
+                    self._offset = int(upd["update_id"]) + 1
+                    self._handle(token, upd)
+            except Exception as exc:
+                text = str(exc)
+                if "Conflict" in text and "getUpdates" in text:
                     LOGGER.error(
-                        "Telegram getUpdates Conflict：同一个 bot token 被多个程序同时轮询。"
-                        "请只保留一个 cloudflare-3xui 容器/进程，并确认本机/其他服务器没有再用这个 token。"
-                        "排查：docker ps | grep cloudflare；docker compose down 后只 up 一次。"
-                        "详情：%s",
-                        exc.description,
+                        "Telegram Conflict：同一 bot token 只能有一个实例在跑。"
+                        "请 docker compose down 后只启动一个容器。 %s",
+                        text,
                     )
                     time.sleep(30)
                 else:
-                    LOGGER.warning("Telegram bot loop error: %s", exc)
-                    time.sleep(5)
-            except Exception as exc:
-                LOGGER.warning("Telegram bot loop error: %s", exc)
-                time.sleep(3)
+                    LOGGER.warning("bot loop: %s", exc)
+                    time.sleep(3)
 
-    def _handle_update(self, token: str, update: dict[str, Any]) -> None:
-        if "callback_query" in update:
-            self._handle_callback(token, update["callback_query"])
+    def _handle(self, token: str, upd: dict[str, Any]) -> None:
+        if "callback_query" in upd:
+            self._on_callback(token, upd["callback_query"])
             return
-        message = update.get("message") or update.get("edited_message")
-        if not isinstance(message, dict):
-            return
-        # Ignore service messages, stickers, photos without caption, etc.
-        if message.get("from", {}).get("is_bot"):
-            return
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        if chat_id is None or not self._authorized(chat_id):
-            return
-        text = str(message.get("text") or message.get("caption") or "").strip()
-        if not text:
+        msg = upd.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        text = str(msg.get("text") or "").strip()
+        if chat_id is None or not self._ok_chat(chat_id) or not text:
             return
 
-        intent = resolve_intent(text)
-        pending = self._pending.get(str(chat_id))
+        # pending lock IP input
+        key = str(chat_id)
+        if key in self._pending and not text.startswith("/"):
+            if text in {"节点列表", "通知设置", "取消"}:
+                self._pending.pop(key, None)
+            else:
+                self._lock_with_ip(token, chat_id, self._pending[key], text)
+                return
 
-        # Menu / slash commands always win over pending lock input.
-        if intent and not intent.startswith("unknown:"):
-            if pending and intent != "cancel":
-                self._pending.pop(str(chat_id), None)
-            self._dispatch_intent(token, chat_id, intent)
-            return
-
-        if pending:
-            self._handle_pending_text(token, chat_id, text, pending)
-            return
-
-        if intent and intent.startswith("unknown:"):
-            # Only reply for real /slash junk — do not spam on free text.
-            send_telegram(
+        intent = self._intent(text)
+        if intent == "start":
+            send(
                 token,
                 chat_id,
-                "不支持该命令。可用：/start /nodes /status /notify，或点下方按钮。",
-                reply_markup=MAIN_KEYBOARD,
+                "菜单：\n• 节点列表 — 查看/暂停/锁定\n• 通知设置 — 成功失败开始休息开关",
+                reply_markup=KEYBOARD,
             )
-            return
-
-        # Free-form chat: ignore silently (no more “未知指令”刷屏).
-        LOGGER.debug("Ignoring non-command text from %s: %s", chat_id, text[:80])
-
-    def _dispatch_intent(self, token: str, chat_id: str | int, intent: str) -> None:
-        if intent == "start":
-            self._send_welcome(token, chat_id)
         elif intent == "nodes":
-            self._send_node_list(token, chat_id)
-        elif intent == "status":
-            self._send_status(token, chat_id)
+            self._send_nodes(token, chat_id)
         elif intent == "notify":
-            self._send_notify_settings(token, chat_id)
+            self._send_notify(token, chat_id)
         elif intent == "cancel":
-            self._pending.pop(str(chat_id), None)
-            send_telegram(token, chat_id, "已取消。", reply_markup=MAIN_KEYBOARD)
+            self._pending.pop(key, None)
+            send(token, chat_id, "已取消", reply_markup=KEYBOARD)
 
-    def _send_welcome(self, token: str, chat_id: str | int) -> None:
-        send_telegram(
-            token,
-            chat_id,
-            "👋 Cloudflare → 3x-ui 控制台已就绪\n"
-            "• 节点列表：查看当前节点与更新状态\n"
-            "• 可暂停参与、锁定固定 IP、解除锁定\n"
-            "• 通知设置：成功/失败/开始/休息消息开关\n"
-            "• 运行状态：查看休息/工作窗口\n\n"
-            "请用下方按钮或菜单命令操作。",
-            reply_markup=MAIN_KEYBOARD,
-        )
-
-    def _send_status(self, token: str, chat_id: str | int) -> None:
-        if self.status_provider:
-            text = self.status_provider()
-        else:
-            text = "暂无状态信息。"
-        send_telegram(token, chat_id, text, reply_markup=MAIN_KEYBOARD)
-
-    def _effective_tg(self) -> dict[str, Any]:
-        return effective_telegram(self._cfg(), self.node_state_path)
-
-    def _notify_text_and_markup(self) -> tuple[str, dict[str, Any]]:
-        tg = self._effective_tg()
-        lines = [
-            "🔔 通知设置",
-            "━━━━━━━━━━━━━━━━",
-            "点按钮可即时开关（写入 node_state.json，无需改 config）：",
-            "",
-        ]
-        rows: list[list[dict[str, str]]] = []
-        for key in NOTIFY_DEFAULTS:
-            enabled = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
-            lines.append(notify_flag_label(key, enabled))
-            action = "关闭" if enabled else "开启"
-            label = NOTIFY_LABELS[key]
-            rows.append([{
-                "text": sanitize_button_text(f"{action}{label}"),
-                "callback_data": f"notify:toggle:{key}",
-            }])
-        rows.append([{"text": "刷新", "callback_data": "notify:refresh"}])
-        return "\n".join(lines), {"inline_keyboard": rows}
-
-    def _send_notify_settings(self, token: str, chat_id: str | int) -> None:
-        text, markup = self._notify_text_and_markup()
-        send_telegram(token, chat_id, text, reply_markup=markup)
+    def _intent(self, text: str) -> str | None:
+        if text in {"节点列表", "节点"}:
+            return "nodes"
+        if text in {"通知设置", "通知"}:
+            return "notify"
+        if text in {"取消"}:
+            return "cancel"
+        m = CMD_RE.match(text)
+        if not m:
+            return None
+        name = m.group(1).lower()
+        if name in {"start", "help", "menu"}:
+            return "start"
+        if name in {"nodes", "node", "list"}:
+            return "nodes"
+        if name in {"notify", "settings"}:
+            return "notify"
+        if name == "cancel":
+            return "cancel"
+        return None
 
     def _panel(self) -> PanelClient:
-        return self.panel_client_factory(self._cfg())
+        return self.panel_factory(self._cfg())
 
-    def _collect_nodes(self) -> list[dict[str, Any]]:
-        client = self._panel()
-        state = load_node_state(self.node_state_path)
-        nodes: list[dict[str, Any]] = []
-        for inbound, line in matching_inbounds(client.list_inbounds()):
-            inbound_id = int(inbound["id"])
-            policy = get_policy(state, inbound_id)
-            nodes.append({
-                "id": inbound_id,
+    def _nodes(self) -> list[dict[str, Any]]:
+        state = load_node_state(self.state_path)
+        out = []
+        for inbound, line in matching_inbounds(self._panel().list_inbounds()):
+            iid = int(inbound["id"])
+            pol = get_policy(state, iid)
+            out.append({
+                "id": iid,
                 "remark": str(inbound.get("remark") or ""),
                 "line": line,
-                "share_addr": str(inbound.get("shareAddr") or ""),
-                "strategy": str(inbound.get("shareAddrStrategy") or ""),
-                "enable": bool(inbound.get("enable", True)),
-                "mode": policy["mode"],
-                "locked_address": policy.get("locked_address"),
+                "addr": str(inbound.get("shareAddr") or ""),
+                "mode": pol["mode"],
+                "locked": pol.get("locked_address"),
             })
-        nodes.sort(key=lambda item: item["id"])
-        return nodes
+        out.sort(key=lambda x: x["id"])
+        return out
 
-    def _list_text_and_markup(self) -> tuple[str, dict[str, Any]]:
-        nodes = self._collect_nodes()
+    def _nodes_view(self) -> tuple[str, dict[str, Any]]:
+        nodes = self._nodes()
         if not nodes:
-            return (
-                "📭 没有找到 remark 含 cucc / cmcc / ctcc / mix 的入站。",
-                {"inline_keyboard": [[{"text": "刷新", "callback_data": "nodes:refresh"}]]},
-            )
-        lines = ["📋 当前节点列表", "━━━━━━━━━━━━━━━━"]
-        keyboard: list[list[dict[str, str]]] = []
-        for node in nodes:
-            status_icon = "✅" if node["enable"] else "⛔"
-            addr = node["share_addr"] or "（空）"
-            locked_hint = f" → {node['locked_address']}" if node["mode"] == MODE_LOCKED and node.get("locked_address") else ""
-            lines.append(
-                f"{status_icon} #{node['id']} {node['remark'] or '无备注'}\n"
-                f"   线路 {node['line']}｜地址 {addr}\n"
-                f"   {mode_label(node['mode'])}{locked_hint}"
-            )
-            label = f"#{node['id']} {(node['remark'] or node['line'])[:12]}"
-            keyboard.append([{
-                "text": sanitize_button_text(label),
-                "callback_data": f"node:{node['id']}",
-            }])
-        keyboard.append([{"text": "刷新", "callback_data": "nodes:refresh"}])
-        return "\n".join(lines), {"inline_keyboard": keyboard}
+            return "没有匹配节点（remark 需含 cucc/cmcc/ctcc/mix）", {
+                "inline_keyboard": [[{"text": "刷新", "callback_data": "n:r"}]]
+            }
+        lines = ["节点列表"]
+        rows = []
+        for n in nodes:
+            extra = f" 锁={n['locked']}" if n["mode"] == MODE_LOCKED and n["locked"] else ""
+            lines.append(f"#{n['id']} {n['remark'] or '-'} | {n['line']} | {n['addr'] or '-'} | {mode_label(n['mode'])}{extra}")
+            rows.append([{"text": f"#{n['id']} {n['remark'][:12] or n['line']}", "callback_data": f"n:{n['id']}"}])
+        rows.append([{"text": "刷新", "callback_data": "n:r"}])
+        return "\n".join(lines), {"inline_keyboard": rows}
 
-    def _send_node_list(self, token: str, chat_id: str | int) -> None:
+    def _send_nodes(self, token: str, chat_id: Any) -> None:
         try:
-            text, markup = self._list_text_and_markup()
+            text, markup = self._nodes_view()
+            send(token, chat_id, text, reply_markup=markup)
         except Exception as exc:
-            LOGGER.exception("List nodes failed")
-            send_telegram(token, chat_id, f"❌ 读取节点失败：{exc}", reply_markup=MAIN_KEYBOARD)
-            return
-        send_telegram(token, chat_id, text, reply_markup=markup)
+            send(token, chat_id, f"读取失败: {exc}", reply_markup=KEYBOARD)
 
-    def _node_detail(self, inbound_id: int) -> tuple[str, dict[str, Any]]:
-        nodes = {node["id"]: node for node in self._collect_nodes()}
-        node = nodes.get(inbound_id)
+    def _node_view(self, iid: int) -> tuple[str, dict[str, Any]]:
+        node = next((n for n in self._nodes() if n["id"] == iid), None)
         if not node:
-            return (
-                f"❌ 未找到节点 #{inbound_id}（可能已删除或 remark 无线路关键字）。",
-                {"inline_keyboard": [[{"text": "« 返回列表", "callback_data": "nodes:refresh"}]]},
-            )
-        addr = node["share_addr"] or "（空）"
-        locked = node.get("locked_address") or "—"
-        panel_state = "启用" if node["enable"] else "禁用"
+            return f"找不到 #{iid}", {"inline_keyboard": [[{"text": "返回", "callback_data": "n:r"}]]}
         text = (
-            f"🎯 节点 #{node['id']}\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"备注：{node['remark'] or '无'}\n"
-            f"线路：{node['line']}\n"
-            f"面板状态：{panel_state}\n"
-            f"当前 shareAddr：{addr}\n"
-            f"策略：{node['strategy'] or '—'}\n"
-            f"更新模式：{mode_label(node['mode'])}\n"
-            f"锁定地址：{locked}\n"
-            f"\n选择操作："
+            f"节点 #{node['id']}\n"
+            f"备注: {node['remark'] or '-'}\n"
+            f"线路: {node['line']}\n"
+            f"地址: {node['addr'] or '-'}\n"
+            f"状态: {mode_label(node['mode'])}\n"
+            f"锁定IP: {node['locked'] or '-'}"
         )
-        rows: list[list[dict[str, str]]] = []
+        rows = []
         if node["mode"] != MODE_AUTO:
-            rows.append([{"text": "恢复自动更新", "callback_data": f"act:auto:{inbound_id}"}])
+            rows.append([{"text": "参与自动更新", "callback_data": f"a:auto:{iid}"}])
         if node["mode"] != MODE_PAUSE:
-            rows.append([{"text": "暂停自动更新", "callback_data": f"act:pause:{inbound_id}"}])
-        rows.append([{"text": "锁定固定IP", "callback_data": f"act:lockask:{inbound_id}"}])
+            rows.append([{"text": "不参与更新", "callback_data": f"a:pause:{iid}"}])
+        rows.append([{"text": "锁定为固定IP", "callback_data": f"a:lock:{iid}"}])
         if node["mode"] == MODE_LOCKED:
-            rows.append([{"text": "解除锁定", "callback_data": f"act:unlock:{inbound_id}"}])
-        rows.append([{"text": "返回列表", "callback_data": "nodes:refresh"}])
+            rows.append([{"text": "解除锁定", "callback_data": f"a:unlock:{iid}"}])
+        rows.append([{"text": "返回列表", "callback_data": "n:r"}])
         return text, {"inline_keyboard": rows}
 
-    def _safe_edit(
-        self,
-        token: str,
-        chat_id: str | int,
-        message_id: int | None,
-        text: str,
-        markup: dict[str, Any] | None = None,
-    ) -> None:
-        if message_id is None:
-            send_telegram(token, chat_id, text, reply_markup=markup)
-            return
-        try:
-            edit_telegram(token, chat_id, int(message_id), text, reply_markup=markup)
-        except Exception as exc:
-            LOGGER.warning("editMessage failed, fallback send: %s", exc)
-            try:
-                send_telegram(token, chat_id, text, reply_markup=markup)
-            except Exception as send_exc:
-                LOGGER.error("fallback send also failed: %s", send_exc)
+    def _notify_view(self) -> tuple[str, dict[str, Any]]:
+        tg = effective_telegram(self._cfg(), self.state_path)
+        lines = ["通知开关（点一下切换）"]
+        rows = []
+        for key, label in NOTIFY_LABELS.items():
+            on = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
+            lines.append(f"{'开' if on else '关'} · {label}")
+            rows.append([{
+                "text": f"{'关闭' if on else '开启'}{label}",
+                "callback_data": f"t:{key}",
+            }])
+        return "\n".join(lines), {"inline_keyboard": rows}
 
-    def _ack(self, token: str, callback_id: str, text: str = "") -> None:
-        """Answer callbacks immediately so Telegram does not return query-too-old."""
-        if not callback_id:
-            return
-        try:
-            answer_callback(token, callback_id, text)
-        except Exception as exc:
-            LOGGER.warning("answerCallbackQuery failed: %s", exc)
+    def _send_notify(self, token: str, chat_id: Any) -> None:
+        text, markup = self._notify_view()
+        send(token, chat_id, text, reply_markup=markup)
 
-    def _handle_callback(self, token: str, query: dict[str, Any]) -> None:
-        data = str(query.get("data") or "")
-        callback_id = str(query.get("id") or "")
-        message = query.get("message") or {}
-        chat = message.get("chat") or {}
-        # Some clients put chat under from/message differently; prefer message.chat.
-        chat_id = chat.get("id")
-        if chat_id is None and isinstance(query.get("from"), dict):
-            # private chats only — not a substitute for group, but avoids hard crash
-            chat_id = query.get("message", {}).get("chat", {}).get("id")
-        message_id = message.get("message_id")
-        if chat_id is None or not self._authorized(chat_id):
-            self._ack(token, callback_id, "未授权")
+    def _on_callback(self, token: str, q: dict[str, Any]) -> None:
+        data = str(q.get("data") or "")
+        cid = str(q.get("id") or "")
+        msg = q.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        mid = msg.get("message_id")
+        if chat_id is None or not self._ok_chat(chat_id):
+            answer(token, cid, "未授权")
             return
-
-        # Acknowledge first: slow panel API after this will no longer break the click.
-        self._ack(token, callback_id)
+        answer(token, cid)  # ack first
 
         try:
-            if data == "nodes:refresh":
-                text, markup = self._list_text_and_markup()
-                self._safe_edit(token, chat_id, message_id, text, markup)
+            if data in {"n:r", "n:list"}:
+                text, markup = self._nodes_view()
+                edit(token, chat_id, int(mid), text, markup) if mid else send(token, chat_id, text, reply_markup=markup)
                 return
-
-            if data.startswith("node:"):
-                inbound_id = int(data.split(":", 1)[1])
-                text, markup = self._node_detail(inbound_id)
-                self._safe_edit(token, chat_id, message_id, text, markup)
+            if data.startswith("n:") and data[2:].isdigit():
+                text, markup = self._node_view(int(data[2:]))
+                edit(token, chat_id, int(mid), text, markup) if mid else send(token, chat_id, text, reply_markup=markup)
                 return
-
-            if data.startswith("act:"):
-                parts = data.split(":")
-                if len(parts) != 3:
-                    send_telegram(token, chat_id, "无效操作", reply_markup=MAIN_KEYBOARD)
+            if data.startswith("a:"):
+                _, action, sid = data.split(":", 2)
+                iid = int(sid)
+                if action == "auto":
+                    set_policy(self.state_path, iid, mode=MODE_AUTO, locked_address=None)
+                elif action == "pause":
+                    set_policy(self.state_path, iid, mode=MODE_PAUSE, locked_address=None)
+                elif action == "unlock":
+                    set_policy(self.state_path, iid, mode=MODE_AUTO, locked_address=None)
+                elif action == "lock":
+                    self._pending[str(chat_id)] = iid
+                    send(token, chat_id, f"发送 #{iid} 要锁定的 IP，或发「取消」", reply_markup=KEYBOARD)
                     return
-                _, action, id_text = parts
-                inbound_id = int(id_text)
-                note = self._apply_action(token, chat_id, action, inbound_id)
-                if action != "lockask":
-                    text, markup = self._node_detail(inbound_id)
-                    self._safe_edit(token, chat_id, message_id, text, markup)
-                    # Confirm result with a short chat line (callback already acked).
-                    send_telegram(token, chat_id, f"✅ {note}", reply_markup=MAIN_KEYBOARD)
+                text, markup = self._node_view(iid)
+                edit(token, chat_id, int(mid), text, markup) if mid else send(token, chat_id, text, reply_markup=markup)
                 return
+            if data.startswith("t:"):
+                key = data[2:]
+                if key not in NOTIFY_DEFAULTS:
+                    return
+                tg = effective_telegram(self._cfg(), self.state_path)
+                cur = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
+                set_notify_flag(self.state_path, key, not cur)
+                text, markup = self._notify_view()
+                edit(token, chat_id, int(mid), text, markup) if mid else send(token, chat_id, text, reply_markup=markup)
+        except Exception as exc:
+            LOGGER.exception("callback failed")
+            send(token, chat_id, f"失败: {exc}", reply_markup=KEYBOARD)
 
-            if data == "notify:refresh" or data.startswith("notify:toggle:"):
-                note = "已刷新"
-                if data.startswith("notify:toggle:"):
-                    key = data.split(":", 2)[2]
-                    if key not in NOTIFY_DEFAULTS:
-                        send_telegram(token, chat_id, "未知开关", reply_markup=MAIN_KEYBOARD)
-                        return
-                    current = bool(self._effective_tg().get(key, NOTIFY_DEFAULTS[key]))
-                    set_notify_flag(self.node_state_path, key, not current)
-                    note = f"{NOTIFY_LABELS[key]} 已{'关闭' if current else '开启'}"
-                text, markup = self._notify_text_and_markup()
-                self._safe_edit(token, chat_id, message_id, text, markup)
-                if data.startswith("notify:toggle:"):
-                    send_telegram(token, chat_id, f"🔔 {note}", reply_markup=MAIN_KEYBOARD)
-                return
-
-            LOGGER.info("Ignoring unknown callback: %s", data)
-        except (TelegramApiError, PanelError, Exception) as exc:
-            LOGGER.exception("Callback failed: %s", data)
-            try:
-                send_telegram(token, chat_id, f"❌ 操作失败：{exc}", reply_markup=MAIN_KEYBOARD)
-            except Exception:
-                pass
-
-    def _apply_action(self, token: str, chat_id: str | int, action: str, inbound_id: int) -> str:
-        if action == "auto":
-            set_policy(self.node_state_path, inbound_id, mode=MODE_AUTO, locked_address=None)
-            return "已恢复自动更新"
-        if action == "pause":
-            set_policy(self.node_state_path, inbound_id, mode=MODE_PAUSE, locked_address=None)
-            return "已暂停自动更新"
-        if action == "unlock":
-            set_policy(self.node_state_path, inbound_id, mode=MODE_AUTO, locked_address=None)
-            return "已解除锁定"
-        if action == "lockask":
-            self._pending[str(chat_id)] = {"action": "lock", "inbound_id": inbound_id}
-            send_telegram(
-                token,
-                chat_id,
-                f"🔒 请发送节点 #{inbound_id} 要锁定的 IP/域名。\n"
-                "发送后会立刻写入 3x-ui，并停止自动更新。\n"
-                "发送 /cancel 或点其他菜单可取消。",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return "等待输入 IP"
-        raise ValueError(f"unknown action {action}")
-
-    def _handle_pending_text(
-        self,
-        token: str,
-        chat_id: str | int,
-        text: str,
-        pending: dict[str, Any],
-    ) -> None:
-        if pending.get("action") != "lock":
-            self._pending.pop(str(chat_id), None)
-            return
-        address = text.strip()
+    def _lock_with_ip(self, token: str, chat_id: Any, iid: int, address: str) -> None:
+        address = address.strip()
         if not address or len(address) > 253:
-            send_telegram(token, chat_id, "地址无效，请重新发送 IP/域名，或 /cancel 取消。")
+            send(token, chat_id, "地址无效，请重发或「取消」")
             return
-        # Allow hostname or IP; lightweight check for pure IP form when it looks like numbers.
-        if address.replace(".", "").isdigit() and not IP_RE.match(address):
-            send_telegram(token, chat_id, "IP 格式不正确，请重新发送，或 /cancel 取消。")
-            return
-        inbound_id = int(pending["inbound_id"])
         try:
             client = self._panel()
-            inbound = client.get_inbound(inbound_id)
+            inbound = client.get_inbound(iid)
             client.update_share_address(inbound, address)
-            set_policy(
-                self.node_state_path,
-                inbound_id,
-                mode=MODE_LOCKED,
-                locked_address=address,
-            )
+            set_policy(self.state_path, iid, mode=MODE_LOCKED, locked_address=address)
             self._pending.pop(str(chat_id), None)
-            send_telegram(
-                token,
-                chat_id,
-                f"✅ 节点 #{inbound_id} 已锁定为 {address}，后续自动同步会跳过它。",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            self._send_node_list(token, chat_id)
-        except (PanelError, Exception) as exc:
-            LOGGER.exception("Lock failed")
-            send_telegram(token, chat_id, f"❌ 锁定失败：{exc}\n可重试发送地址，或 /cancel 取消。")
+            send(token, chat_id, f"#{iid} 已锁定 {address}", reply_markup=KEYBOARD)
+            self._send_nodes(token, chat_id)
+        except Exception as exc:
+            send(token, chat_id, f"锁定失败: {exc}\n可重发 IP 或「取消」")
