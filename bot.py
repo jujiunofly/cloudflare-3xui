@@ -13,9 +13,14 @@ from node_state import (
     MODE_AUTO,
     MODE_LOCKED,
     MODE_PAUSE,
+    NOTIFY_DEFAULTS,
+    NOTIFY_LABELS,
+    effective_telegram,
     get_policy,
     load_node_state,
     mode_label,
+    notify_flag_label,
+    set_notify_flag,
     set_policy,
 )
 from notifier import (
@@ -35,7 +40,10 @@ IP_RE = re.compile(
 )
 
 MAIN_KEYBOARD = {
-    "keyboard": [[{"text": "节点列表"}, {"text": "运行状态"}]],
+    "keyboard": [
+        [{"text": "节点列表"}, {"text": "运行状态"}],
+        [{"text": "通知设置"}],
+    ],
     "resize_keyboard": True,
     "is_persistent": True,
 }
@@ -97,6 +105,7 @@ class TelegramBot:
                         {"command": "start", "description": "打开菜单"},
                         {"command": "nodes", "description": "查看节点列表"},
                         {"command": "status", "description": "查看运行状态"},
+                        {"command": "notify", "description": "通知开关设置"},
                     ],
                 )
                 updates = get_updates(token, self._offset, timeout=25, request_timeout=35)
@@ -136,11 +145,13 @@ class TelegramBot:
             self._send_node_list(token, chat_id)
         elif lower in {"/status", "status", "运行状态", "状态"}:
             self._send_status(token, chat_id)
+        elif lower in {"/notify", "notify", "通知设置", "通知"}:
+            self._send_notify_settings(token, chat_id)
         else:
             send_telegram(
                 token,
                 chat_id,
-                "可用命令：/nodes 节点列表，/status 运行状态，或点下方按钮。",
+                "可用命令：/nodes 节点列表，/status 运行状态，/notify 通知设置，或点下方按钮。",
                 reply_markup=MAIN_KEYBOARD,
             )
 
@@ -151,6 +162,7 @@ class TelegramBot:
             "👋 Cloudflare → 3x-ui 控制台已就绪\n"
             "• 节点列表：查看当前节点与更新状态\n"
             "• 可暂停参与、锁定固定 IP、解除锁定\n"
+            "• 通知设置：成功/失败/开始/休息消息开关\n"
             "• 运行状态：查看休息/工作窗口",
             reply_markup=MAIN_KEYBOARD,
         )
@@ -161,6 +173,34 @@ class TelegramBot:
         else:
             text = "暂无状态信息。"
         send_telegram(token, chat_id, text, reply_markup=MAIN_KEYBOARD)
+
+    def _effective_tg(self) -> dict[str, Any]:
+        return effective_telegram(self._cfg(), self.node_state_path)
+
+    def _notify_text_and_markup(self) -> tuple[str, dict[str, Any]]:
+        tg = self._effective_tg()
+        lines = [
+            "🔔 通知设置",
+            "━━━━━━━━━━━━━━━━",
+            "点按钮可即时开关（写入 node_state.json，无需改 config）：",
+            "",
+        ]
+        rows: list[list[dict[str, str]]] = []
+        for key in NOTIFY_DEFAULTS:
+            enabled = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
+            lines.append(notify_flag_label(key, enabled))
+            action = "关" if enabled else "开"
+            label = NOTIFY_LABELS[key]
+            rows.append([{
+                "text": f"{'🔕' if enabled else '🔔'} {action} {label}",
+                "callback_data": f"notify:toggle:{key}",
+            }])
+        rows.append([{"text": "🔄 刷新", "callback_data": "notify:refresh"}])
+        return "\n".join(lines), {"inline_keyboard": rows}
+
+    def _send_notify_settings(self, token: str, chat_id: str | int) -> None:
+        text, markup = self._notify_text_and_markup()
+        send_telegram(token, chat_id, text, reply_markup=markup)
 
     def _panel(self) -> PanelClient:
         return self.panel_client_factory(self._cfg())
@@ -293,6 +333,25 @@ class TelegramBot:
                 text, markup = self._node_detail(inbound_id)
                 if message_id is not None and action != "lockask":
                     edit_telegram(token, chat_id, int(message_id), text, reply_markup=markup)
+                answer_callback(token, callback_id, note)
+                return
+
+            if data == "notify:refresh" or data.startswith("notify:toggle:"):
+                if data.startswith("notify:toggle:"):
+                    key = data.split(":", 2)[2]
+                    if key not in NOTIFY_DEFAULTS:
+                        answer_callback(token, callback_id, "未知开关")
+                        return
+                    current = bool(self._effective_tg().get(key, NOTIFY_DEFAULTS[key]))
+                    set_notify_flag(self.node_state_path, key, not current)
+                    note = f"{NOTIFY_LABELS[key]} 已{'关闭' if current else '开启'}"
+                else:
+                    note = "已刷新"
+                text, markup = self._notify_text_and_markup()
+                if message_id is not None:
+                    edit_telegram(token, chat_id, int(message_id), text, reply_markup=markup)
+                else:
+                    send_telegram(token, chat_id, text, reply_markup=markup)
                 answer_callback(token, callback_id, note)
                 return
 

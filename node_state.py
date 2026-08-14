@@ -1,4 +1,4 @@
-"""Persistent per-inbound update policies (auto / pause / locked)."""
+"""Persistent per-inbound policies and Telegram notification overrides."""
 from __future__ import annotations
 
 import json
@@ -15,11 +15,36 @@ MODE_PAUSE = "pause"
 MODE_LOCKED = "locked"
 VALID_MODES = {MODE_AUTO, MODE_PAUSE, MODE_LOCKED}
 
-DEFAULT_STATE: dict[str, Any] = {"schema_version": 1, "inbounds": {}}
+# Defaults used when neither config nor node_state sets a value.
+NOTIFY_DEFAULTS: dict[str, bool] = {
+    "notify_on_success": False,
+    "notify_on_failure": True,
+    "notify_on_start": True,
+    "notify_on_rest": True,
+}
+
+NOTIFY_LABELS: dict[str, str] = {
+    "notify_on_success": "成功消息",
+    "notify_on_failure": "失败消息",
+    "notify_on_start": "开始工作通知",
+    "notify_on_rest": "进入休息通知",
+}
+
+DEFAULT_STATE: dict[str, Any] = {"schema_version": 1, "inbounds": {}, "telegram": {}}
 
 
 def default_policy() -> dict[str, Any]:
     return {"mode": MODE_AUTO, "locked_address": None}
+
+
+def _clean_telegram(raw: Any) -> dict[str, bool]:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, bool] = {}
+    for key in NOTIFY_DEFAULTS:
+        if key in raw:
+            cleaned[key] = bool(raw[key])
+    return cleaned
 
 
 def load_node_state(path: Path) -> dict[str, Any]:
@@ -48,7 +73,11 @@ def load_node_state(path: Path) -> dict[str, Any]:
                 "mode": mode,
                 "locked_address": str(locked).strip() if locked else None,
             }
-        return {"schema_version": 1, "inbounds": cleaned}
+        return {
+            "schema_version": 1,
+            "inbounds": cleaned,
+            "telegram": _clean_telegram(data.get("telegram")),
+        }
 
 
 def save_node_state(path: Path, state: dict[str, Any]) -> None:
@@ -57,6 +86,7 @@ def save_node_state(path: Path, state: dict[str, Any]) -> None:
         payload = {
             "schema_version": 1,
             "inbounds": state.get("inbounds", {}),
+            "telegram": _clean_telegram(state.get("telegram")),
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -97,9 +127,42 @@ def set_policy(
         return get_policy(state, inbound_id)
 
 
+def set_notify_flag(path: Path, key: str, enabled: bool) -> dict[str, bool]:
+    if key not in NOTIFY_DEFAULTS:
+        raise ValueError(f"unknown notify key: {key}")
+    with _LOCK:
+        state = load_node_state(path)
+        telegram = dict(state.get("telegram") or {})
+        telegram[key] = bool(enabled)
+        state["telegram"] = telegram
+        save_node_state(path, state)
+        return dict(state["telegram"])
+
+
+def merge_telegram_settings(config_telegram: dict[str, Any], state: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return telegram settings: config base, overridden by node_state.telegram."""
+    merged = dict(config_telegram or {})
+    for key, default in NOTIFY_DEFAULTS.items():
+        if key not in merged:
+            merged[key] = default
+    overrides = _clean_telegram((state or {}).get("telegram"))
+    merged.update(overrides)
+    return merged
+
+
+def effective_telegram(config: dict[str, Any], state_path: Path) -> dict[str, Any]:
+    state = load_node_state(state_path)
+    return merge_telegram_settings(config.get("telegram", {}), state)
+
+
 def mode_label(mode: str) -> str:
     return {
         MODE_AUTO: "🔄 自动更新",
         MODE_PAUSE: "⏸ 暂停更新",
         MODE_LOCKED: "🔒 已锁定",
     }.get(mode, mode)
+
+
+def notify_flag_label(key: str, enabled: bool) -> str:
+    name = NOTIFY_LABELS.get(key, key)
+    return f"{'✅' if enabled else '❌'} {name}"

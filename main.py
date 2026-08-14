@@ -15,7 +15,7 @@ from typing import Any
 from api_client import fetch_apis, load_config
 from bot import TelegramBot
 from browser_capture import discover_sync
-from node_state import load_node_state
+from node_state import NOTIFY_DEFAULTS, effective_telegram, load_node_state
 from notifier import notify_telegram, telegram_enabled
 from panel_client import PanelClient, PanelError, update_matching_inbounds
 
@@ -186,7 +186,7 @@ def maybe_notify_schedule_transition(
         return active
     if last_active == active:
         return active
-    tg = config.get("telegram", {})
+    tg = effective_telegram(config, NODE_STATE_PATH)
     timeout = float(config.get("runtime", {}).get("request_timeout_seconds", 20))
     if active and tg.get("notify_on_start", True):
         notify_telegram(tg, schedule_start_message(config, now), timeout)
@@ -227,8 +227,9 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
             node_policies=node_state.get("inbounds", {}),
         )
         message = success_message(addresses, changes, stats, now)
-        if config["telegram"].get("notify_on_success", False):
-            notify_telegram(config["telegram"], message, timeout)
+        tg = effective_telegram(config, NODE_STATE_PATH)
+        if tg.get("notify_on_success", False):
+            notify_telegram(tg, message, timeout)
         return message
     except Exception as exc:
         # The caller pre-records an attempted success so success notifications
@@ -236,8 +237,9 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
         stats.successes = max(0, stats.successes - 1)
         stats.failures += 1
         logging.exception("Sync failed: %s", exc)
-        if config["telegram"].get("notify_on_failure", True):
-            notify_telegram(config["telegram"], failure_message(exc, stats, now), timeout)
+        tg = effective_telegram(config, NODE_STATE_PATH)
+        if tg.get("notify_on_failure", True):
+            notify_telegram(tg, failure_message(exc, stats, now), timeout)
         raise
 
 
@@ -260,6 +262,16 @@ def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
         memory = "尚未观察"
     else:
         memory = "工作" if last_active else "休息"
+    tg = effective_telegram(config, NODE_STATE_PATH)
+    notify_bits = "｜".join(
+        f"{'✅' if tg.get(key, NOTIFY_DEFAULTS[key]) else '❌'}{label}"
+        for key, label in (
+            ("notify_on_success", "成功"),
+            ("notify_on_failure", "失败"),
+            ("notify_on_start", "开始"),
+            ("notify_on_rest", "休息"),
+        )
+    )
     return (
         "📟 运行状态\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -268,7 +280,8 @@ def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
         f"窗口：{window}\n"
         f"今日：尝试 {stats.attempts}｜成功 {stats.successes}｜失败 {stats.failures}\n"
         f"状态记忆：{memory}\n"
-        "提示：发送「节点列表」可管理是否参与更新 / 锁定 IP。"
+        f"通知：{notify_bits}\n"
+        "提示：发送「节点列表」管理节点；「通知设置」开关各类消息。"
     )
 
 
