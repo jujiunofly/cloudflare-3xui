@@ -191,6 +191,16 @@ def get_updates(token: str, offset: int | None, timeout: int, request_timeout: f
     return result if isinstance(result, list) else []
 
 
+def delete_webhook(token: str, *, drop_pending: bool = True, timeout: float = 20) -> None:
+    """Ensure polling mode: webhooks and long-poll cannot both own the same bot."""
+    _api(
+        token,
+        "deleteWebhook",
+        {"drop_pending_updates": bool(drop_pending)},
+        timeout=timeout,
+    )
+
+
 def set_bot_commands(token: str, commands: list[dict[str, str]], timeout: float = 20) -> None:
     try:
         # Clear stale command menus first (old bots / other apps may leave junk entries).

@@ -101,9 +101,17 @@
 
 策略持久化在 `node_state.json`（Docker 需挂载，见下）。
 
-> 若曾用同一 Token 接过 webhook，需先删除：  
-> `https://api.telegram.org/bot<Token>/deleteWebhook`  
-> 本项目使用 long polling（`getUpdates`）。
+> 本项目使用 long polling（`getUpdates`）。启动时会自动 `deleteWebhook`。  
+>
+> **同一 bot token 只能有一个程序在跑。** 若日志出现  
+> `Conflict: terminated by other getUpdates request`，说明还有别的容器/本机进程/其他机器在用这个 token：
+>
+> ```bash
+> docker ps | grep cloudflare
+> docker compose down
+> # 确认没有第二个 compose / 旧容器 / 本机 python main.py
+> docker compose up -d --build
+> ```
 
 ## 推荐 Docker Compose 部署
 

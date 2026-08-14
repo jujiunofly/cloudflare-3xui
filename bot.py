@@ -26,6 +26,7 @@ from node_state import (
 from notifier import (
     TelegramApiError,
     answer_callback,
+    delete_webhook,
     edit_telegram,
     get_updates,
     sanitize_button_text,
@@ -113,6 +114,7 @@ class TelegramBot:
         self._thread: threading.Thread | None = None
         self._offset: int | None = None
         self._commands_registered = False
+        self._webhook_cleared = False
         # chat_id -> {"action": "lock", "inbound_id": int}
         self._pending: dict[str, dict[str, Any]] = {}
 
@@ -140,12 +142,18 @@ class TelegramBot:
     def _token(self) -> str:
         return str(self._tg().get("bot_token", "")).strip()
 
-    def _ensure_commands(self, token: str) -> None:
-        if self._commands_registered:
-            return
-        set_bot_commands(token, BOT_COMMANDS)
-        self._commands_registered = True
-        LOGGER.info("Telegram bot commands registered")
+    def _prepare_polling(self, token: str) -> None:
+        if not self._webhook_cleared:
+            try:
+                delete_webhook(token, drop_pending=True)
+                LOGGER.info("Telegram webhook cleared; using long polling")
+            except Exception as exc:
+                LOGGER.warning("deleteWebhook failed: %s", exc)
+            self._webhook_cleared = True
+        if not self._commands_registered:
+            set_bot_commands(token, BOT_COMMANDS)
+            self._commands_registered = True
+            LOGGER.info("Telegram bot commands registered")
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -155,7 +163,7 @@ class TelegramBot:
                     time.sleep(5)
                     continue
                 token = self._token()
-                self._ensure_commands(token)
+                self._prepare_polling(token)
                 updates = get_updates(token, self._offset, timeout=25, request_timeout=35)
                 for update in updates:
                     update_id = int(update.get("update_id", 0))
@@ -164,6 +172,20 @@ class TelegramBot:
                         self._handle_update(token, update)
                     except Exception:
                         LOGGER.exception("Failed to handle Telegram update %s", update_id)
+            except TelegramApiError as exc:
+                desc = exc.description.lower()
+                if "conflict" in desc and "getupdates" in desc:
+                    LOGGER.error(
+                        "Telegram getUpdates Conflict：同一个 bot token 被多个程序同时轮询。"
+                        "请只保留一个 cloudflare-3xui 容器/进程，并确认本机/其他服务器没有再用这个 token。"
+                        "排查：docker ps | grep cloudflare；docker compose down 后只 up 一次。"
+                        "详情：%s",
+                        exc.description,
+                    )
+                    time.sleep(30)
+                else:
+                    LOGGER.warning("Telegram bot loop error: %s", exc)
+                    time.sleep(5)
             except Exception as exc:
                 LOGGER.warning("Telegram bot loop error: %s", exc)
                 time.sleep(3)
