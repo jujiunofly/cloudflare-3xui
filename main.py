@@ -15,7 +15,7 @@ from typing import Any
 from api_client import fetch_apis, load_config
 from bot import TelegramBot
 from browser_capture import discover_sync
-from node_state import NOTIFY_DEFAULTS, effective_telegram, load_node_state
+from node_state import NOTIFY_DEFAULTS, effective_config, effective_telegram, load_node_state
 from notifier import notify_telegram, telegram_enabled
 from panel_client import PanelClient, PanelError, update_matching_inbounds
 
@@ -87,6 +87,11 @@ def panel_client(config: dict[str, Any]) -> PanelClient:
     if not base_url or not token or "example" in base_url:
         raise PanelError("configure panel.base_url and panel.api_token")
     return PanelClient(base_url, token, float(panel.get("timeout_seconds", 45)), int(panel.get("retries", 3)))
+
+
+def load_effective_config() -> dict[str, Any]:
+    """config.json + node_state overrides (schedule/runtime/notify)."""
+    return effective_config(load_config(CONFIG_PATH), NODE_STATE_PATH)
 
 
 def tg_of(config: dict[str, Any]) -> dict[str, Any]:
@@ -218,10 +223,11 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
 def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
     now = datetime.now()
     try:
-        config = load_config(CONFIG_PATH)
+        config = load_effective_config()
     except Exception as exc:
         return f"❌ 读取配置失败：{exc}"
     schedule = config.get("schedule", {})
+    runtime = config.get("runtime", {})
     enabled = bool(schedule.get("enabled", False))
     active = in_run_window(config, now)
     if not enabled:
@@ -250,10 +256,12 @@ def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
         f"当前：{phase}\n"
         f"时间：{now:%Y-%m-%d %H:%M:%S}\n"
         f"窗口：{window}\n"
+        f"间隔：{runtime.get('interval_minutes', '?')} 分钟"
+        f" ±{runtime.get('jitter_seconds', '?')} 秒\n"
         f"今日：尝试 {stats.attempts}｜成功 {stats.successes}｜失败 {stats.failures}\n"
         f"状态记忆：{memory}\n"
         f"通知：{notify_bits}\n"
-        "提示：点「节点列表」管理节点；「通知设置」开关消息。"
+        "提示：「运行设置」可改间隔/起止时间；「节点列表」管理节点。"
     )
 
 
@@ -283,7 +291,7 @@ def main() -> int:
         delay = 600.0
         now = datetime.now()
         try:
-            config = load_config(CONFIG_PATH)
+            config = load_effective_config()
             active = in_run_window(config, now)
             last_active = maybe_schedule_notice(config, now, active, last_active)
             if active:

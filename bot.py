@@ -15,13 +15,18 @@ from node_state import (
     MODE_PAUSE,
     NOTIFY_DEFAULTS,
     NOTIFY_LABELS,
+    clear_schedule_runtime_overrides,
+    effective_config,
     effective_telegram,
     get_policy,
     load_node_state,
     mode_label,
     notify_flag_label,
+    parse_hhmm,
     set_notify_flag,
     set_policy,
+    set_runtime_override,
+    set_schedule_override,
 )
 from notifier import answer, edit, get_updates, send, setup_bot, telegram_enabled
 from panel_client import PanelClient, matching_inbounds
@@ -32,9 +37,16 @@ CMD_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)")
 KEYBOARD = {
     "keyboard": [
         [{"text": "节点列表"}, {"text": "通知设置"}],
-        [{"text": "运行状态"}],
+        [{"text": "运行设置"}, {"text": "运行状态"}],
     ],
     "resize_keyboard": True,
+}
+
+PENDING_PROMPTS = {
+    "start": "请发送开始时间，格式 HH:MM\n例如：08:00",
+    "end": "请发送结束时间，格式 HH:MM\n例如：23:30",
+    "interval": "请发送同步间隔（分钟）\n例如：10   范围 1～1440",
+    "jitter": "请发送随机抖动（秒）\n例如：45   范围 0～3600",
 }
 
 
@@ -54,8 +66,8 @@ class TelegramBot:
         self._thread: threading.Thread | None = None
         self._offset: int | None = None
         self._ready = False
-        # chat_id -> inbound id waiting for lock IP
-        self._pending_lock: dict[str, int] = {}
+        # chat_id -> {"kind": "lock"|"setting", ...}
+        self._pending: dict[str, dict[str, Any]] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -68,17 +80,21 @@ class TelegramBot:
     def stop(self) -> None:
         self._stop.set()
 
-    def _cfg(self) -> dict[str, Any]:
+    def _raw_cfg(self) -> dict[str, Any]:
         return load_config(self.config_path)
 
+    def _cfg(self) -> dict[str, Any]:
+        return effective_config(self._raw_cfg(), self.state_path)
+
     def _tg(self) -> dict[str, Any]:
-        return self._cfg().get("telegram", {})
+        return effective_telegram(self._raw_cfg(), self.state_path)
 
     def _token(self) -> str:
-        return str(self._tg().get("bot_token", "")).strip()
+        return str(self._raw_cfg().get("telegram", {}).get("bot_token", "")).strip()
 
     def _allowed(self, chat_id: Any) -> bool:
-        return str(chat_id).strip() == str(self._tg().get("chat_id", "")).strip()
+        expected = str(self._raw_cfg().get("telegram", {}).get("chat_id", "")).strip()
+        return str(chat_id).strip() == expected
 
     def _panel(self) -> PanelClient:
         return self.panel_factory(self._cfg())
@@ -127,15 +143,16 @@ class TelegramBot:
         key = str(chat_id)
         intent = self._intent(text)
 
-        # Menu always cancels pending lock input.
+        # Menu commands cancel pending free-text input (except cancel itself).
         if intent and intent != "unknown":
             if intent != "cancel":
-                self._pending_lock.pop(key, None)
+                self._pending.pop(key, None)
             self._run_intent(token, chat_id, intent)
             return
 
-        if key in self._pending_lock:
-            self._finish_lock(token, chat_id, self._pending_lock[key], text)
+        pending = self._pending.get(key)
+        if pending:
+            self._finish_pending(token, chat_id, pending, text)
             return
 
         # Ignore free chat; no spam.
@@ -146,6 +163,8 @@ class TelegramBot:
             "节点": "nodes",
             "通知设置": "notify",
             "通知": "notify",
+            "运行设置": "schedule",
+            "计划设置": "schedule",
             "运行状态": "status",
             "状态": "status",
             "菜单": "start",
@@ -161,8 +180,10 @@ class TelegramBot:
             return "start"
         if name in {"nodes", "node", "list"}:
             return "nodes"
-        if name in {"notify", "settings"}:
+        if name in {"notify"}:
             return "notify"
+        if name in {"schedule", "runtime", "settings"}:
+            return "schedule"
         if name in {"status"}:
             return "status"
         if name == "cancel":
@@ -176,8 +197,9 @@ class TelegramBot:
                 chat_id,
                 "👋 Cloudflare → 3x-ui 控制台\n"
                 "━━━━━━━━━━━━━━━━\n"
-                "• 节点列表：查看状态 / 参与更新 / 锁定 IP\n"
-                "• 通知设置：成功·失败·开始·休息开关\n"
+                "• 节点列表：状态 / 参与更新 / 锁定 IP\n"
+                "• 通知设置：成功·失败·开始·休息\n"
+                "• 运行设置：间隔 / 开始·结束时间\n"
                 "• 运行状态：当前是否在工作时段\n"
                 "点下方按钮即可。",
                 reply_markup=KEYBOARD,
@@ -186,17 +208,19 @@ class TelegramBot:
             self._send_nodes(token, chat_id)
         elif intent == "notify":
             self._send_notify(token, chat_id)
+        elif intent == "schedule":
+            self._send_schedule(token, chat_id)
         elif intent == "status":
             text = self.status_provider() if self.status_provider else "暂无状态"
             send(token, chat_id, text, reply_markup=KEYBOARD)
         elif intent == "cancel":
-            self._pending_lock.pop(str(chat_id), None)
+            self._pending.pop(str(chat_id), None)
             send(token, chat_id, "已取消。", reply_markup=KEYBOARD)
         elif intent == "unknown":
             send(
                 token,
                 chat_id,
-                "不支持该命令。可用：/start /nodes /notify /status",
+                "不支持该命令。可用：/start /nodes /notify /schedule /status",
                 reply_markup=KEYBOARD,
             )
 
@@ -351,6 +375,58 @@ class TelegramBot:
         text, markup = self._notify_view()
         send(token, chat_id, text, reply_markup=markup)
 
+    def _schedule_view(self) -> tuple[str, dict[str, Any]]:
+        cfg = self._cfg()
+        base = self._raw_cfg()
+        state = load_node_state(self.state_path)
+        schedule = cfg.get("schedule", {})
+        runtime = cfg.get("runtime", {})
+        enabled = bool(schedule.get("enabled", False))
+        start = schedule.get("start", "08:00")
+        end = schedule.get("end", "23:30")
+        interval = runtime.get("interval_minutes", 10)
+        jitter = runtime.get("jitter_seconds", 45)
+        ov_s = state.get("schedule") or {}
+        ov_r = state.get("runtime") or {}
+        tag = "（含机器人覆盖）" if ov_s or ov_r else "（config 默认）"
+        text = (
+            f"⚙️  运行设置 {tag}\n"
+            f"────────────────\n"
+            f"时间窗    {'开启' if enabled else '关闭（全天跑）'}\n"
+            f"开始      {start}\n"
+            f"结束      {end}\n"
+            f"同步间隔  {interval} 分钟\n"
+            f"随机抖动  {jitter} 秒\n"
+            f"────────────────\n"
+            f"config 原始：窗={'开' if base.get('schedule', {}).get('enabled') else '关'} "
+            f"{base.get('schedule', {}).get('start', '?')}→{base.get('schedule', {}).get('end', '?')}  "
+            f"间隔 {base.get('runtime', {}).get('interval_minutes', '?')}m\n"
+            f"点按钮修改 ↓"
+        )
+        rows = [
+            [{"text": f"{'关闭' if enabled else '开启'}时间窗", "callback_data": "sch:toggle"}],
+            [
+                {"text": f"开始 {start}", "callback_data": "sch:ask:start"},
+                {"text": f"结束 {end}", "callback_data": "sch:ask:end"},
+            ],
+            [
+                {"text": f"间隔 {interval}m", "callback_data": "sch:ask:interval"},
+                {"text": f"抖动 {jitter}s", "callback_data": "sch:ask:jitter"},
+            ],
+            [
+                {"text": "10分钟", "callback_data": "sch:set:interval:10"},
+                {"text": "15分钟", "callback_data": "sch:set:interval:15"},
+                {"text": "30分钟", "callback_data": "sch:set:interval:30"},
+            ],
+            [{"text": "恢复 config 默认", "callback_data": "sch:reset"}],
+            [{"text": "🔄 刷新", "callback_data": "schedule"}],
+        ]
+        return text, {"inline_keyboard": rows}
+
+    def _send_schedule(self, token: str, chat_id: Any) -> None:
+        text, markup = self._schedule_view()
+        send(token, chat_id, text, reply_markup=markup)
+
     def _show(self, token: str, chat_id: Any, mid: int | None, text: str, markup: dict[str, Any]) -> None:
         if mid is not None:
             edit(token, chat_id, int(mid), text, markup)
@@ -379,6 +455,10 @@ class TelegramBot:
                 text, markup = self._notify_view()
                 self._show(token, chat_id, mid, text, markup)
                 return
+            if data == "schedule":
+                text, markup = self._schedule_view()
+                self._show(token, chat_id, mid, text, markup)
+                return
             if data.startswith("node:"):
                 iid = int(data.split(":", 1)[1])
                 text, markup = self._node_view(iid)
@@ -394,7 +474,7 @@ class TelegramBot:
                 elif action == "unlock":
                     set_policy(self.state_path, iid, mode=MODE_AUTO, locked_address=None)
                 elif action == "lock":
-                    self._pending_lock[str(chat_id)] = iid
+                    self._pending[str(chat_id)] = {"kind": "lock", "inbound_id": iid}
                     send(
                         token,
                         chat_id,
@@ -411,14 +491,66 @@ class TelegramBot:
                 key = data[3:]
                 if key not in NOTIFY_DEFAULTS:
                     return
-                tg = effective_telegram(self._cfg(), self.state_path)
+                tg = effective_telegram(self._raw_cfg(), self.state_path)
                 cur = bool(tg.get(key, NOTIFY_DEFAULTS[key]))
                 set_notify_flag(self.state_path, key, not cur)
                 text, markup = self._notify_view()
                 self._show(token, chat_id, mid, text, markup)
+                return
+            if data.startswith("sch:"):
+                self._on_schedule_callback(token, chat_id, mid, data)
         except Exception as exc:
             LOGGER.exception("callback %s", data)
             send(token, chat_id, f"❌ 操作失败：{exc}", reply_markup=KEYBOARD)
+
+    def _on_schedule_callback(self, token: str, chat_id: Any, mid: int | None, data: str) -> None:
+        if data == "sch:toggle":
+            cfg = self._cfg()
+            cur = bool(cfg.get("schedule", {}).get("enabled", False))
+            set_schedule_override(self.state_path, enabled=not cur)
+        elif data == "sch:reset":
+            clear_schedule_runtime_overrides(self.state_path)
+            send(token, chat_id, "✅ 已恢复为 config.json 中的默认运行参数", reply_markup=KEYBOARD)
+        elif data.startswith("sch:ask:"):
+            field = data.split(":", 2)[2]
+            if field not in PENDING_PROMPTS:
+                return
+            self._pending[str(chat_id)] = {"kind": "setting", "field": field}
+            send(token, chat_id, PENDING_PROMPTS[field] + "\n发「取消」可放弃。", reply_markup=KEYBOARD)
+            return
+        elif data.startswith("sch:set:interval:"):
+            minutes = float(data.rsplit(":", 1)[1])
+            set_runtime_override(self.state_path, interval_minutes=minutes)
+        text, markup = self._schedule_view()
+        self._show(token, chat_id, mid, text, markup)
+
+    def _finish_pending(self, token: str, chat_id: Any, pending: dict[str, Any], text: str) -> None:
+        kind = pending.get("kind")
+        if kind == "lock":
+            self._finish_lock(token, chat_id, int(pending["inbound_id"]), text)
+            return
+        if kind == "setting":
+            self._finish_setting(token, chat_id, str(pending.get("field")), text)
+            return
+        self._pending.pop(str(chat_id), None)
+
+    def _finish_setting(self, token: str, chat_id: Any, field: str, text: str) -> None:
+        try:
+            if field == "start":
+                set_schedule_override(self.state_path, start=parse_hhmm(text))
+            elif field == "end":
+                set_schedule_override(self.state_path, end=parse_hhmm(text))
+            elif field == "interval":
+                set_runtime_override(self.state_path, interval_minutes=float(text.strip()))
+            elif field == "jitter":
+                set_runtime_override(self.state_path, jitter_seconds=float(text.strip()))
+            else:
+                raise ValueError(f"未知字段 {field}")
+            self._pending.pop(str(chat_id), None)
+            send(token, chat_id, "✅ 已保存", reply_markup=KEYBOARD)
+            self._send_schedule(token, chat_id)
+        except Exception as exc:
+            send(token, chat_id, f"❌ {exc}\n请重发，或「取消」")
 
     def _finish_lock(self, token: str, chat_id: Any, iid: int, address: str) -> None:
         address = address.strip()
@@ -430,7 +562,7 @@ class TelegramBot:
             inbound = client.get_inbound(iid)
             client.update_share_address(inbound, address)
             set_policy(self.state_path, iid, mode=MODE_LOCKED, locked_address=address)
-            self._pending_lock.pop(str(chat_id), None)
+            self._pending.pop(str(chat_id), None)
             send(token, chat_id, f"✅ #{iid} 已锁定为 {address}", reply_markup=KEYBOARD)
             self._send_nodes(token, chat_id)
         except Exception as exc:

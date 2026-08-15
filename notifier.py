@@ -134,6 +134,7 @@ def setup_bot(token: str) -> None:
                     {"command": "start", "description": "打开菜单"},
                     {"command": "nodes", "description": "节点列表"},
                     {"command": "notify", "description": "通知开关"},
+                    {"command": "schedule", "description": "运行设置"},
                     {"command": "status", "description": "运行状态"},
                     {"command": "cancel", "description": "取消输入"},
                 ]
