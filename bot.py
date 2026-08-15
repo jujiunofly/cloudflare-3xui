@@ -218,6 +218,19 @@ class TelegramBot:
         nodes.sort(key=lambda n: n["id"])
         return nodes
 
+    @staticmethod
+    def _mode_badge(mode: str) -> str:
+        return {
+            MODE_AUTO: "自动",
+            MODE_PAUSE: "暂停",
+            MODE_LOCKED: "锁定",
+        }.get(mode, mode)
+
+    @staticmethod
+    def _short_remark(remark: str, limit: int = 18) -> str:
+        text = (remark or "无备注").strip()
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
     def _nodes_view(self) -> tuple[str, dict[str, Any]]:
         nodes = self._collect_nodes()
         if not nodes:
@@ -225,19 +238,54 @@ class TelegramBot:
                 "📭 没有匹配节点\nremark 需包含 cucc / cmcc / ctcc / mix",
                 {"inline_keyboard": [[{"text": "刷新", "callback_data": "nodes"}]]},
             )
-        lines = ["📋 节点列表", "━━━━━━━━━━━━━━━━"]
-        rows: list[list[dict[str, str]]] = []
+
+        auto_n = sum(1 for n in nodes if n["mode"] == MODE_AUTO)
+        pause_n = sum(1 for n in nodes if n["mode"] == MODE_PAUSE)
+        lock_n = sum(1 for n in nodes if n["mode"] == MODE_LOCKED)
+
+        # Compact, scannable cards — one visual block per node.
+        lines = [
+            "📋  节点一览",
+            f"共 {len(nodes)} 条  ·  自动 {auto_n}  ·  暂停 {pause_n}  ·  锁定 {lock_n}",
+            "────────────────",
+        ]
         for n in nodes:
-            lock_hint = f" → {n['locked']}" if n["mode"] == MODE_LOCKED and n.get("locked") else ""
-            icon = "✅" if n["enable"] else "⛔"
-            lines.append(
-                f"{icon} #{n['id']} {n['remark'] or '无备注'}\n"
-                f"   {n['line']}｜{n['addr'] or '（空）'}\n"
-                f"   {mode_label(n['mode'])}{lock_hint}"
-            )
-            label = f"#{n['id']} {(n['remark'] or n['line'])[:12]}"
-            rows.append([{"text": label[:64], "callback_data": f"node:{n['id']}"}])
-        rows.append([{"text": "刷新", "callback_data": "nodes"}])
+            status = self._mode_badge(n["mode"])
+            if n["mode"] == MODE_LOCKED and n.get("locked"):
+                status = f"锁定 {n['locked']}"
+            elif n["mode"] == MODE_PAUSE:
+                status = "暂停"
+            if not n["enable"]:
+                status = f"面板关闭 · {status}"
+            addr = n["addr"] or "—"
+            remark = self._short_remark(n["remark"] or "", 20)
+            lines.append(f"#{n['id']:<3} {remark}")
+            lines.append(f"     {n['line']}  ·  {addr}  ·  {status}")
+            lines.append("")
+
+        while lines and lines[-1] == "":
+            lines.pop()
+        lines.append("────────────────")
+        lines.append("👇 点下面按钮管理对应节点")
+
+        # Two buttons per row.
+        rows: list[list[dict[str, str]]] = []
+        pair: list[dict[str, str]] = []
+        for n in nodes:
+            raw = re.sub(r"[\U0001F1E6-\U0001F1FF]+", "", n["remark"] or "")
+            raw = re.sub(r"\s+", "", raw) or n["line"]
+            label = f"#{n['id']} {raw[:10]}"
+            if n["mode"] == MODE_PAUSE:
+                label = f"⏸{label}"
+            elif n["mode"] == MODE_LOCKED:
+                label = f"🔒{label}"
+            pair.append({"text": label[:64], "callback_data": f"node:{n['id']}"})
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([{"text": "🔄 刷新列表", "callback_data": "nodes"}])
         return "\n".join(lines), {"inline_keyboard": rows}
 
     def _node_view(self, iid: int) -> tuple[str, dict[str, Any]]:
@@ -245,27 +293,31 @@ class TelegramBot:
         if not node:
             return (
                 f"❌ 未找到节点 #{iid}",
-                {"inline_keyboard": [[{"text": "返回列表", "callback_data": "nodes"}]]},
+                {"inline_keyboard": [[{"text": "« 返回列表", "callback_data": "nodes"}]]},
             )
+        mode = mode_label(node["mode"])
+        if node["mode"] == MODE_LOCKED and node.get("locked"):
+            mode = f"{mode}\n锁定 IP：{node['locked']}"
         text = (
-            f"🎯 节点 #{node['id']}\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"备注：{node['remark'] or '无'}\n"
-            f"线路：{node['line']}\n"
-            f"当前 IP：{node['addr'] or '（空）'}\n"
-            f"更新模式：{mode_label(node['mode'])}\n"
-            f"锁定地址：{node['locked'] or '—'}\n"
-            f"\n选择操作："
+            f"🎯  节点 #{node['id']}\n"
+            f"────────────────\n"
+            f"名称    {node['remark'] or '无'}\n"
+            f"线路    {node['line']}\n"
+            f"地址    {node['addr'] or '—'}\n"
+            f"状态    {mode}\n"
+            f"面板    {'启用' if node['enable'] else '禁用'}\n"
+            f"────────────────\n"
+            f"选择操作 ↓"
         )
         rows: list[list[dict[str, str]]] = []
         if node["mode"] != MODE_AUTO:
-            rows.append([{"text": "参与自动更新", "callback_data": f"act:auto:{iid}"}])
+            rows.append([{"text": "✅ 参与自动更新", "callback_data": f"act:auto:{iid}"}])
         if node["mode"] != MODE_PAUSE:
-            rows.append([{"text": "不参与更新", "callback_data": f"act:pause:{iid}"}])
-        rows.append([{"text": "锁定为固定 IP", "callback_data": f"act:lock:{iid}"}])
+            rows.append([{"text": "⏸ 不参与更新", "callback_data": f"act:pause:{iid}"}])
+        rows.append([{"text": "🔒 锁定为固定 IP", "callback_data": f"act:lock:{iid}"}])
         if node["mode"] == MODE_LOCKED:
-            rows.append([{"text": "解除锁定", "callback_data": f"act:unlock:{iid}"}])
-        rows.append([{"text": "返回列表", "callback_data": "nodes"}])
+            rows.append([{"text": "🔓 解除锁定", "callback_data": f"act:unlock:{iid}"}])
+        rows.append([{"text": "« 返回列表", "callback_data": "nodes"}])
         return text, {"inline_keyboard": rows}
 
     def _notify_view(self) -> tuple[str, dict[str, Any]]:
