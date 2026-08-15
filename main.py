@@ -92,17 +92,92 @@ def tg_of(config: dict[str, Any]) -> dict[str, Any]:
     return effective_telegram(config, NODE_STATE_PATH)
 
 
+def status_lines(stats: DailyStats, now: datetime) -> str:
+    return (
+        f"🕒 更新时间：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"📒 今日第 {stats.attempts} 次｜成功 {stats.successes}｜失败 {stats.failures}"
+    )
+
+
+def schedule_start_message(config: dict[str, Any], now: datetime) -> str:
+    schedule = config.get("schedule", {})
+    return (
+        "🌅 工作时段开始\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🕒 现在：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"📅 窗口：{schedule.get('start', '?')} → {schedule.get('end', '?')}\n"
+        "🚀 同步任务已苏醒，开始抓取优选 IP。"
+    )
+
+
+def schedule_rest_message(config: dict[str, Any], now: datetime) -> str:
+    schedule = config.get("schedule", {})
+    return (
+        "🌙 进入休息时段\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🕒 现在：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"📅 窗口：{schedule.get('start', '?')} → {schedule.get('end', '?')}\n"
+        "😴 本时段不再自动同步，节点地址保持现状。\n"
+        "✨ 到点会再叫你开工。"
+    )
+
+
+def success_message(
+    addresses: dict[str, str],
+    changes: list[dict[str, Any]],
+    stats: DailyStats,
+    now: datetime,
+) -> str:
+    updated = [item for item in changes if item.get("changed") and not item.get("fallback") and not item.get("skipped")]
+    unchanged = [item for item in changes if not item.get("changed") and not item.get("skipped")]
+    fallback = [item for item in changes if item.get("fallback")]
+    paused = [item for item in changes if item.get("reason") == "pause"]
+    locked = [item for item in changes if item.get("reason") == "locked"]
+    address_lines = "\n".join(f"  • {line}: {address}" for line, address in addresses.items())
+    change_lines = (
+        "\n".join(f"  • #{item['id']} {item['remark']} → {item['address']}" for item in updated + fallback)
+        or "  • 无需变更"
+    )
+    skip_lines: list[str] = []
+    if paused:
+        skip_lines.append("⏸ 暂停：" + "、".join(f"#{item['id']}" for item in paused))
+    if locked:
+        skip_lines.append("🔒 锁定：" + "、".join(f"#{item['id']}" for item in locked))
+    skip_block = ("\n" + "\n".join(skip_lines)) if skip_lines else ""
+    return (
+        "🛰️ Cloudflare → 3x-ui 🫛泡豆🫛同步完成\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "📡 本轮优选 IP\n"
+        f"{address_lines}\n"
+        "🛠️ 入站处理\n"
+        f"{change_lines}{skip_block}\n"
+        f"📊 更新 {len(updated)} 条｜保持 {len(unchanged)} 条｜单条回退 {len(fallback)} 条"
+        f"｜暂停 {len(paused)}｜锁定 {len(locked)}\n"
+        f"{status_lines(stats, now)}\n"
+        "✨ 下一班车将按配置时间加随机抖动抵达。"
+    )
+
+
+def failure_message(exc: Exception, stats: DailyStats, now: datetime) -> str:
+    return (
+        "🚨 Cloudflare → 3x-ui 本轮异常\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"⚠️ 原因：{exc}\n"
+        "🛡️ 未受影响的入站保持原值；仅发生更新/校验失败的单条入站会尝试回退到默认地址。\n"
+        f"{status_lines(stats, now)}\n"
+        "🔁 程序会在下一轮自动重试。"
+    )
+
+
 def maybe_schedule_notice(config: dict[str, Any], now: datetime, active: bool, last: bool | None) -> bool:
     if not config.get("schedule", {}).get("enabled", False) or last is None or last == active:
         return active
     tg = tg_of(config)
     timeout = float(config.get("runtime", {}).get("request_timeout_seconds", 20))
-    start = config.get("schedule", {}).get("start", "?")
-    end = config.get("schedule", {}).get("end", "?")
     if active and tg.get("notify_on_start", True):
-        notify_telegram(tg, f"开始工作 {now:%H:%M}\n窗口 {start}-{end}", timeout)
+        notify_telegram(tg, schedule_start_message(config, now), timeout)
     if not active and tg.get("notify_on_rest", True):
-        notify_telegram(tg, f"进入休息 {now:%H:%M}\n窗口 {start}-{end}", timeout)
+        notify_telegram(tg, schedule_rest_message(config, now), timeout)
     return active
 
 
@@ -126,22 +201,16 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
         fallback = str(runtime.get("fallback_share_addr", "")).strip() if runtime.get("fallback_on_failure", True) else None
         state = load_node_state(NODE_STATE_PATH)
         changes = update_matching_inbounds(client, addresses, fallback, node_policies=state.get("inbounds", {}))
-        updated = sum(1 for c in changes if c.get("changed") and not c.get("fallback") and not c.get("skipped"))
-        skipped = sum(1 for c in changes if c.get("skipped"))
-        msg = (
-            f"同步完成 {now:%H:%M:%S}\n"
-            + "\n".join(f"{k}: {v}" for k, v in addresses.items())
-            + f"\n更新 {updated} / 跳过 {skipped} / 今日 {stats.successes}成功 {stats.failures}失败"
-        )
+        message = success_message(addresses, changes, stats, now)
         if tg.get("notify_on_success", False):
-            notify_telegram(tg, msg, timeout)
-        return msg
+            notify_telegram(tg, message, timeout)
+        return message
     except Exception as exc:
         stats.successes = max(0, stats.successes - 1)
         stats.failures += 1
         logging.exception("Sync failed: %s", exc)
         if tg.get("notify_on_failure", True):
-            notify_telegram(tg, f"同步失败: {exc}\n今日 {stats.successes}成功 {stats.failures}失败", timeout)
+            notify_telegram(tg, failure_message(exc, stats, now), timeout)
         raise
 
 
