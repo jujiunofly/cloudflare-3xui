@@ -14,12 +14,17 @@ https://github.com/jujiunofly/cloudflare-3xui
 ## 功能
 
 1. 定时同步（可配工作时段）
-2. **开始工作 / 进入休息** Telegram 通知
-3. 可选：成功 / 失败通知（`config.json` 开关）
+2. **开始 / 休息** 通知（完整样式）
+3. 成功 / 失败通知（可关）
+4. **Telegram 交互**
+   - 节点列表：看状态
+   - 是否参与自动更新
+   - 锁定固定 IP / 解除锁定
+   - 通知开关（成功·失败·开始·休息）
 
-当前**没有**机器人交互（节点列表、按钮等已移除）。
+## config
 
-## Telegram 通知
+见 `config.example.json`。Telegram 段：
 
 ```json
 "telegram": {
@@ -33,9 +38,30 @@ https://github.com/jujiunofly/cloudflare-3xui
 }
 ```
 
-1. `@BotFather` 建 bot，拿到 token  
-2. 用 `@userinfobot` 或 `getUpdates` 拿到 `chat_id`  
-3. `schedule.enabled: true` 时才会发开始/休息通知  
+机器人里改的开关写在 `node_state.json`，会覆盖上面默认值。
+
+## Telegram 设置
+
+1. `@BotFather` → `/newbot` → 复制 token → `bot_token`
+2. 给机器人发一条消息，用 `@userinfobot` 或  
+   `https://api.telegram.org/bot<Token>/getUpdates` 看 `chat.id` → `chat_id`
+3. `enabled: true`，重启
+4. 发 `/start`，用下方按钮：
+
+| 按钮 | 作用 |
+| --- | --- |
+| 节点列表 | 点节点 → 参与更新 / 不参与 / 锁定 IP / 解锁 |
+| 通知设置 | 开关成功、失败、开始、休息消息 |
+| 运行状态 | 当前工作/休息窗 + 今日统计 |
+
+锁定：点「锁定为固定 IP」→ 直接发 IP → 写入 3x-ui 并不再自动改。
+
+**一个 bot token 只能跑一个容器。** 日志出现 Conflict 时：
+
+```bash
+docker compose down
+docker compose up -d
+```
 
 ## Docker
 
@@ -56,3 +82,5 @@ docker compose up -d --build
 cd /opt/cloudflare-3xui/app && git pull
 cd .. && docker compose up -d --build
 ```
+
+`node_state.json` / `cloudflare_ip.json` 必须是**文件**，不能是目录。

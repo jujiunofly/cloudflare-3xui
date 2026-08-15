@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from api_client import fetch_apis, load_config
+from bot import TelegramBot
 from browser_capture import discover_sync
-from node_state import effective_telegram, load_node_state
-from notifier import notify_telegram
+from node_state import NOTIFY_DEFAULTS, effective_telegram, load_node_state
+from notifier import notify_telegram, telegram_enabled
 from panel_client import PanelClient, PanelError, update_matching_inbounds
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -214,6 +215,48 @@ def sync_once(config: dict[str, Any], stats: DailyStats, now: datetime) -> str:
         raise
 
 
+def build_status_text(stats: DailyStats, last_active: bool | None) -> str:
+    now = datetime.now()
+    try:
+        config = load_config(CONFIG_PATH)
+    except Exception as exc:
+        return f"❌ 读取配置失败：{exc}"
+    schedule = config.get("schedule", {})
+    enabled = bool(schedule.get("enabled", False))
+    active = in_run_window(config, now)
+    if not enabled:
+        phase = "全天运行（未启用时间窗）"
+        window = "关闭（全天）"
+    else:
+        phase = "🟢 工作中" if active else "🌙 休息中"
+        window = f"{schedule.get('start')} → {schedule.get('end')}"
+    if last_active is None:
+        memory = "尚未观察"
+    else:
+        memory = "工作" if last_active else "休息"
+    tg = tg_of(config)
+    notify_bits = "｜".join(
+        f"{'✅' if tg.get(key, NOTIFY_DEFAULTS[key]) else '❌'}{label}"
+        for key, label in (
+            ("notify_on_success", "成功"),
+            ("notify_on_failure", "失败"),
+            ("notify_on_start", "开始"),
+            ("notify_on_rest", "休息"),
+        )
+    )
+    return (
+        "📟 运行状态\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"当前：{phase}\n"
+        f"时间：{now:%Y-%m-%d %H:%M:%S}\n"
+        f"窗口：{window}\n"
+        f"今日：尝试 {stats.attempts}｜成功 {stats.successes}｜失败 {stats.failures}\n"
+        f"状态记忆：{memory}\n"
+        f"通知：{notify_bits}\n"
+        "提示：点「节点列表」管理节点；「通知设置」开关消息。"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
@@ -221,6 +264,19 @@ def main() -> int:
     setup_logging()
     stats = DailyStats()
     last_active: bool | None = None
+
+    if not args.once:
+        try:
+            boot = load_config(CONFIG_PATH)
+            if telegram_enabled(boot.get("telegram", {})):
+                TelegramBot(
+                    CONFIG_PATH,
+                    NODE_STATE_PATH,
+                    panel_client,
+                    status_provider=lambda: build_status_text(stats, last_active),
+                ).start()
+        except Exception as exc:
+            logging.warning("Telegram bot not started: %s", exc)
 
     while True:
         ok = True
